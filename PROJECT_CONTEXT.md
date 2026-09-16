@@ -130,7 +130,11 @@ issues ─┬─< issue_comments >─ users (author)
 - `POST /api/v1/auth/login` — public. Returns a JWT access token + safe user profile. Rate-limited.
 - `GET /api/v1/auth/me` — requires a valid JWT. Returns the caller's own profile (role, team) loaded fresh from the database.
 - `POST /api/v1/auth/logout` — requires a valid JWT. Stateless: confirms the request, invalidates nothing server-side (see DECISIONS.md D22).
-- `GET /api/v1/_rbac-demo/{user-only|resolver-only|admin-only|resolver-or-admin}` — temporary, Phase 3 only. Exists solely to exercise the RBAC dependency chain over real HTTP; removed once Phase 4's issue endpoints exist to test against instead (DECISIONS.md D24).
+- `POST /api/v1/issues` — any authenticated user. Creates an issue (`status=OPEN`, `ai_analysis_status=PENDING`); no AI trigger yet (DECISIONS.md D32).
+- `GET /api/v1/issues` — any authenticated user. Paginated, optional `status` filter. A `USER` only ever sees their own issues (forced server-side); `RESOLVER`/`ADMIN` see all (coarse-grained — DECISIONS.md D29).
+- `GET /api/v1/issues/{id}` — owner, or any `RESOLVER`/`ADMIN`. 404 if the issue doesn't exist, 403 if it exists but the caller can't see it.
+- `PATCH /api/v1/issues/{id}/status` — `RESOLVER`/`ADMIN` only. Validates the target against the D8 transition table using a freshly row-locked read (D12/D31); structurally cannot reach `CLOSED` (reserved for Phase 7's confirmation flow — D30).
+- `GET /api/v1/_rbac-demo/{user-only|resolver-only|admin-only|resolver-or-admin}` — still temporary. Kept alongside the issue endpoints because no issue endpoint is ADMIN-only or USER-only specifically, so this remains the only way to test those particular role combinations over real HTTP; will be removed once a real admin-only endpoint exists (e.g. Phase 8 admin management).
 
 Remaining endpoints defined in detail as later phases build them.
 
@@ -164,6 +168,20 @@ Client → POST /auth/register or /auth/login → FastAPI
 
 **Frontend**: `AuthContext` (React context) holds `user`/`isLoading`, hydrates from a stored token via `/auth/me` on load, exposes `login`/`register`/`logout`. `ProtectedRoute` redirects unauthenticated visitors to `/login` — UX only, not a security boundary (the backend enforces everything independently). Token stored in `localStorage`, attached via `Authorization` header (DECISIONS.md D27, XSS tradeoff documented explicitly).
 
+## ISSUE LIFECYCLE (Phase 4 — implemented and tested)
+
+**Creation**: any authenticated user → `IssueCreateRequest` (title ≤200 chars, description ≤5000 chars, both required non-empty) → `issue_service.create_issue` inserts the issue (`status=OPEN`, `ai_analysis_status=PENDING` — column defaults, nothing actively sets them) and a `SYSTEM_CREATE` `issue_status_history` row in the same transaction → commit → return. No AI trigger exists yet — added in Phase 5 (DECISIONS.md D32).
+
+**Status transitions**: `PATCH /issues/{id}/status`, `RESOLVER`/`ADMIN` only. `app/services/status_transition_rules.py` holds the D8 allow-list as a pure, framework-agnostic function:
+```
+OPEN → TRIAGED → ASSIGNED → IN_PROGRESS ⇄ WAITING_FOR_USER → RESOLVED
+```
+`RESOLVED` has no outgoing transition in this table — reaching `CLOSED` is reserved for Phase 7's user-confirmation endpoint (DECISIONS.md D9, D30). Every accepted transition writes an `issue_status_history` row (`trigger=MANUAL`, `changed_by_id=`the acting resolver/admin).
+
+**Concurrency**: `issue_repository.get_issue_by_id_for_update` uses `SELECT ... FOR UPDATE` inside the transition transaction, so a concurrent transition request on the same issue blocks until the first commits, then validates against whatever that first request actually left behind — never a stale or client-supplied status (DECISIONS.md D12, D31). Verified with a real two-thread, two-connection test against a genuinely shared row, not the test suite's usual rollback-isolated session.
+
+**Authorization**: coarse-grained for now (DECISIONS.md D29) — a `USER` can only see their own issues (owner_id filter forced server-side, no way to request otherwise); `RESOLVER`/`ADMIN` can see and transition *any* issue, with no team-scoping yet since routing (Phase 5) is what will populate `current_team_id`, and Phase 7 is where resolver access narrows to "my team's issues only."
+
 ## ARCHITECTURE
 Layered monolith (Option A, see DECISIONS.md): single FastAPI service, single React SPA, single Postgres database.
 Backend layout: `app/{main, api, core, models, schemas, services, repositories, db, tests}`.
@@ -182,19 +200,19 @@ Never `User Issue → AI → blindly trust → persist`.
 **AI output validation is strict, not best-effort.** Pydantic schemas define exactly what a valid suggestion looks like (category/sub_category from the configured set, priority from the allowed enum, non-empty summary/reasoning). Malformed JSON, missing fields, or out-of-vocabulary values are never silently coerced into something plausible — the backend either normalizes through an explicitly supported mapping or marks the analysis `FAILED` and leaves the issue in its current business state for manual triage.
 
 ## IMPORTANT DECISIONS
-See DECISIONS.md for full reasoning. Summary: monolithic FastAPI + React (Option A) with FastAPI `BackgroundTasks` for AI chosen over a Celery/Redis worker split (Option B) and microservices (Option C) for MVP — revisit Option B only if AI load or retry guarantees demand it. AI processing state (`ai_analysis_status`) is kept strictly separate from the issue business lifecycle (`status`). No LangChain/RAG/vector DB/agent framework is used — the `AIProvider` is a plain, understandable abstraction over an OpenAI-compatible API. Database (Phase 2): UUIDv4 keys everywhere, RESTRICT-vs-CASCADE deletion split, composite FKs for category/sub-category integrity, and a GiST exclusion constraint for SLA pause intervals — see D15–D19. Auth (Phase 3): JWT carries no role claim, role/is_active always reloaded from the database per request, stateless logout, localStorage token storage, in-memory single-process rate limiting — see D20–D28.
+See DECISIONS.md for full reasoning. Summary: monolithic FastAPI + React (Option A) with FastAPI `BackgroundTasks` for AI chosen over a Celery/Redis worker split (Option B) and microservices (Option C) for MVP — revisit Option B only if AI load or retry guarantees demand it. AI processing state (`ai_analysis_status`) is kept strictly separate from the issue business lifecycle (`status`). No LangChain/RAG/vector DB/agent framework is used — the `AIProvider` is a plain, understandable abstraction over an OpenAI-compatible API. Database (Phase 2): UUIDv4 keys everywhere, RESTRICT-vs-CASCADE deletion split, composite FKs for category/sub-category integrity, and a GiST exclusion constraint for SLA pause intervals — see D15–D19. Auth (Phase 3): JWT carries no role claim, role/is_active always reloaded from the database per request, stateless logout, localStorage token storage, in-memory single-process rate limiting — see D20–D28. Issues (Phase 4): coarse-grained owner/staff authorization, `SELECT FOR UPDATE`-backed transition validation, RESOLVED→CLOSED structurally blocked until Phase 7, no AI-trigger stub — see D29–D32.
 
 ## KNOWN BUGS
 None currently known.
 
 ## CURRENT STATUS
-Phase 3 (authentication + RBAC) complete, on top of the Phase 2 database foundation. Architecture approved by the developer through four rounds of clarification (D1–D14), the database layer (D15–D19), and now authentication/RBAC (D20–D28) — all in DECISIONS.md.
+Phase 4 (issue creation + core lifecycle) complete, on top of Phases 2–3. Architecture approved by the developer through four rounds of clarification (D1–D14), the database layer (D15–D19), authentication/RBAC (D20–D28), and now the issue domain (D29–D32) — all in DECISIONS.md.
 
-Verified working: 87 pytest tests passing (40 database + 47 auth/RBAC — registration, login, JWT validation, `/me`, logout, all USER/RESOLVER/ADMIN combinations via real HTTP requests, rate limiting, CORS, error handling), all against a real PostgreSQL database; registration/login/me/logout/RBAC/disabled-user behavior manually verified via curl against both a host-run backend and the full Docker Compose stack; frontend builds cleanly with the new login/register/protected-home pages and boots in both dev-server and Docker modes. The frontend's interactive behavior was verified via HTTP status codes and a successful build/boot, not a real browser — no browser-automation tool was available in this session, so visual/interactive correctness (form validation UX, redirect behavior on click, etc.) is unverified beyond what TypeScript compilation and the build process catch.
+Verified working: 115 pytest tests passing (40 database + 47 auth/RBAC + 28 issue creation/retrieval/transitions, including a genuine two-thread/two-connection concurrency test), all against a real PostgreSQL database; issue creation/listing/status-transition behavior manually verified via curl against both a host-run backend and the full Docker Compose stack; frontend still builds and boots unaffected (no issue UI yet — that's Phase 8). The frontend's interactive behavior remains verified only via HTTP status codes and a successful build/boot, not a real browser (no browser-automation tool available in this session).
 
 ## PENDING TASKS
-- Phase 4: issue creation + core lifecycle (create/get/list issues, server-side status-transition validation, ownership checks).
-- Phases 5–11: per the roadmap in the initial architecture discussion (AI classification + deterministic routing → SLA engine → comments/assignments/resolver workflow → dashboards/admin → security attack pass → production deployment).
+- Phase 5: AI provider abstraction + deterministic routing (the AI-trigger wiring `create_issue` doesn't have yet, `RoutingService`, `routing_rules`/`sla_rules` lookups, manual reanalysis).
+- Phases 6–11: SLA engine → comments/assignments/resolver workflow (incl. RESOLVED→CLOSED confirmation) → dashboards/admin → security attack pass → production deployment.
 
 ## CONSTRAINTS
 - No SQLite as a Postgres substitute, anywhere.

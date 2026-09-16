@@ -371,3 +371,51 @@ Scope rule to avoid AI undoing human decisions: if the issue is still `status=OP
 **Reasoning**: a wildcard origin combined with `allow_credentials=True` (needed for the `Authorization` header to be sent cross-origin in some configurations) is specifically what browsers refuse and what CORS misconfiguration checklists flag first — keeping this environment-driven means development stays convenient (one default origin) while production is forced to be explicit about exactly which frontend domain(s) may call the API.
 
 **Status**: active.
+
+---
+
+## D29 — Issue authorization in Phase 4 is coarse-grained: owner-only for USER, all-issues for RESOLVER/ADMIN
+
+**Context**: Phase 4 is the first phase with a real protected resource (`issues`), so resource-level authorization (D24's deferred item) has to be built now. But the two things a fully team-scoped model would need — routing that sets an issue's `current_team_id` (Phase 5) and resolver-workflow rules for what "my team's issues" even means operationally (Phase 7) — don't exist yet.
+
+**Decision**: `issue_service._can_view_issue` and `list_issues_for_user` implement exactly two tiers: a `USER` may only see issues where `owner_id` matches their own id (enforced by forcing the query filter server-side — there is no request parameter that lets a `USER` ask for someone else's issues); a `RESOLVER` or `ADMIN` may see and status-transition *any* issue, with no team filter at all yet.
+
+**Reasoning**: this is an honest, temporary simplification rather than a guess at team-scoping rules that don't have real requirements yet (no assignment mechanism exists to scope by). Building a fake team filter now, against data that's always empty (`current_team_id` is always NULL until Phase 5), would be speculative code with no way to verify it's even correct. Narrowing RESOLVER access to "issues assigned to my team" is explicit, tracked work for Phase 7 (DECISIONS.md D24), not something this phase pretends to have solved.
+
+**Status**: active. Superseded by Phase 7's team-scoped resolver access.
+
+---
+
+## D30 — Status transition endpoint: RESOLVER/ADMIN only, and structurally cannot reach CLOSED
+
+**Context**: `PATCH /issues/{id}/status` is the first place the D8 transition table (designed during the original architecture review) actually gets enforced in code, and needed a concrete authorization rule plus a decision about the RESOLVED→CLOSED edge specifically.
+
+**Decision**: only `RESOLVER` or `ADMIN` may call this endpoint (`IssueAccessDeniedError` → 403 for a `USER`, including the issue's own owner). The transition table itself (`app/services/status_transition_rules.py`) gives `RESOLVED` an empty set of allowed next states — so even a resolver/admin cannot reach `CLOSED` through this endpoint; the attempt fails with the same "invalid transition" 400 as any other disallowed move.
+
+**Reasoning**: matches D9's requirement that closing an issue requires the *submitting user's* explicit confirmation, not a resolver's own say-so — building a separate, dedicated confirmation endpoint now (before comments/resolution-recording exist) would mean either a stub or an incomplete flow. Blocking the transition entirely at the rule-table level, rather than adding an ad hoc role check only on that one target status, keeps the enforcement in the one place all transition rules already live, and makes the boundary self-documenting: `RESOLVED: frozenset()` in the table *is* the statement "nothing reaches CLOSED from here yet."
+
+**Status**: active. Superseded by Phase 7's dedicated user-confirmation endpoint, which will be the only path to `CLOSED`.
+
+---
+
+## D31 — Concurrent status transitions: `SELECT ... FOR UPDATE` implementing D12
+
+**Context**: D12 (from the original architecture review) specified the *policy* — never validate a transition against a client-supplied or stale status, always the real current database state — without yet having code to enforce it. Phase 4 is where that became real.
+
+**Decision**: `issue_repository.get_issue_by_id_for_update` issues `SELECT ... FOR UPDATE`, so a second concurrent transition request on the same issue blocks at the database level until the first transaction commits or rolls back, then reads whatever state the first one actually left behind. `tests/test_issue_status_transitions.py::test_concurrent_transitions_are_serialized_against_real_current_state` verifies this with two real threads and two independent database connections against the same committed row (not the SAVEPOINT-isolated `db_session` fixture other tests use, which wouldn't give two threads a genuine race to serialize) — it asserts the invariant that holds regardless of which thread's lock wins the nondeterministic race, rather than a single hardcoded winner, since actually asserting a fixed winner would make the test flaky and would be asserting something false about how OS thread scheduling works.
+
+**Reasoning**: this is the direct, tested implementation of the exact scenario D12 was written to prevent (resolver A and B both starting from `ASSIGNED`, only one of whose intended transitions can be legitimate once the other commits first) — and confirms the earlier architecture-review nuance about D12 was correct: whichever request is evaluated second legitimately sees the *new* current state and may succeed via a different, still-valid transition path than it originally assumed, which is correct behavior, not a bug.
+
+**Status**: active.
+
+---
+
+## D32 — No AI-trigger wiring in Phase 4; nothing to stub
+
+**Context**: the Phase 4 creation flow, as originally sketched during the architecture review (D3/D4), ends with "commit → return → trigger background AI analysis." Phase 4's actual boundary explicitly excludes AI.
+
+**Decision**: `issue_service.create_issue` creates the issue, writes the `SYSTEM_CREATE` status-history row, commits, and returns — nothing else. There is no background task call, no stub function, no placeholder AI trigger anywhere in the Phase 4 code. `issue.ai_analysis_status` starts at `PENDING` purely because that's the column's default value (set in Phase 2), not because anything actively initiated analysis.
+
+**Reasoning**: the project rules explicitly forbid "TODO-driven fake functionality." A stub `trigger_ai_analysis()` function that does nothing (or that always leaves the issue at `PENDING` forever) would be exactly that - dead weight Phase 5 would have to find and replace rather than a real extension point. The actual `BackgroundTasks.add_task(...)` call is added in Phase 5's `create_issue`, at the same time the `AIProvider` it calls is built - there's nothing correct to write here before that exists.
+
+**Status**: active. Superseded by Phase 5.

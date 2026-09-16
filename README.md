@@ -143,23 +143,28 @@ The test suite needs a reachable PostgreSQL server (the same one `DATABASE_URL` 
 
 **Rate limiting**: `/auth/login` and `/auth/register` are protected by a lightweight in-memory, single-process limiter (10 attempts/60s by default) — explicitly not a distributed rate limiter; see DECISIONS.md D25.
 
+## Issue lifecycle
+
+`POST /api/v1/issues` (any authenticated user), `GET /api/v1/issues` (paginated, filterable — a USER sees only their own, RESOLVER/ADMIN see all), `GET /api/v1/issues/{id}`, `PATCH /api/v1/issues/{id}/status` (RESOLVER/ADMIN only). Status transitions are validated server-side against a fixed allow-list (`OPEN → TRIAGED → ASSIGNED → IN_PROGRESS ⇄ WAITING_FOR_USER → RESOLVED`) using a `SELECT ... FOR UPDATE` row lock, so a concurrent transition request is always evaluated against the real current state, never a stale or client-supplied one — verified with a genuine multi-threaded test, not just asserted. `RESOLVED → CLOSED` is intentionally unreachable through this endpoint; it's reserved for Phase 7's dedicated user-confirmation flow. See PROJECT_CONTEXT.md's ISSUE LIFECYCLE section and DECISIONS.md D29–D32.
+
 ## Current status
 
-Phase 3 (authentication + RBAC) is complete, on top of the Phase 2 database foundation. 87 passing pytest tests (40 database + 47 auth/RBAC), covering registration, login, JWT validation, `/me`, logout, all USER/RESOLVER/ADMIN authorization combinations, rate limiting, CORS, and error handling — all via real HTTP requests against the running FastAPI app, not mocked. See PROJECT_CONTEXT.md's AUTHENTICATION & RBAC section for the full flow and DECISIONS.md D20–D28 for the design reasoning. No issue API or AI integration exists yet — see PROJECT_CONTEXT.md's "Pending tasks." This README does not claim functionality that doesn't exist yet.
+Phase 4 (issue creation + core lifecycle) is complete, on top of Phases 2–3. 115 passing pytest tests (40 database + 47 auth/RBAC + 28 issue domain, including a real two-thread concurrency test), all via real HTTP requests / real database transactions, not mocked. See PROJECT_CONTEXT.md's ISSUE LIFECYCLE section for the full flow and DECISIONS.md D29–D32 for the design reasoning. No AI integration exists yet — see PROJECT_CONTEXT.md's "Pending tasks." This README does not claim functionality that doesn't exist yet.
 
 ## AI architecture
 
-Documented in full in DECISIONS.md (D4–D6, D10, D13). Summary: the `AIProvider` service is a thin wrapper around an OpenAI-compatible chat completions API that returns a validated structured suggestion (category, sub_category, suggested_priority, summary, reasoning) — nothing more. It has no authority over authorization, routing, priority, or SLA. Implementation lands in Phase 7.
+Documented in full in DECISIONS.md (D4–D6, D10, D13, D32). Summary: the `AIProvider` service is a thin wrapper around an OpenAI-compatible chat completions API that returns a validated structured suggestion (category, sub_category, suggested_priority, summary, reasoning) — nothing more. It has no authority over authorization, routing, priority, or SLA. Implementation lands in Phase 5.
 
 ## Security considerations
 
-Implemented so far (Phase 3): passwords hashed with bcrypt, never stored or returned in plaintext; JWT signature and expiration always verified server-side; role/active-state always read fresh from the database, never trusted from the token; public registration structurally cannot create an elevated-privilege account; login responses don't reveal whether an email is registered; CORS restricted to an explicit origin allow-list; lightweight rate limiting on auth endpoints; unhandled exceptions (including database failures) never leak internals to the client. Full attack-review findings are in the Phase 3 conversation history and DECISIONS.md D20–D28. Still to come: the broader Phase 9 security/failure attack pass once issue/AI/SLA functionality exists to attack.
+Implemented so far (Phases 3–4): passwords hashed with bcrypt, never stored or returned in plaintext; JWT signature and expiration always verified server-side; role/active-state always read fresh from the database, never trusted from the token; public registration structurally cannot create an elevated-privilege account; login responses don't reveal whether an email is registered; CORS restricted to an explicit origin allow-list; lightweight rate limiting on auth endpoints; unhandled exceptions (including database failures) never leak internals to the client; issue access is authorization-checked server-side (owner or staff role) regardless of what a client requests; status transitions are validated against a locked, real-time database read, never trusted client state. Full attack-review findings are in DECISIONS.md D20–D32. Still to come: the broader Phase 9 security/failure attack pass once AI/SLA/resolver-workflow functionality exists to attack.
 
 ## Limitations
 
-- No issue API or AI integration exists yet (Phase 3 of 11 complete).
+- No AI integration exists yet (Phase 4 of 11 complete).
 - No admin-facing way to provision RESOLVER/ADMIN accounts yet — those roles can currently only be assigned by writing directly to the database. A controlled provisioning flow is a later-phase concern (DECISIONS.md D23).
 - The database has no admin-facing way to populate categories/teams/routing/SLA rules yet; those tables are empty until a later phase adds one (or an isolated dev-only seed script).
+- Issue authorization is coarse-grained (owner vs. any staff), not team-scoped yet — DECISIONS.md D29. There is no assignment mechanism yet either (Phase 5/7).
 - Logout does not invalidate the token server-side (stateless JWT tradeoff, DECISIONS.md D22) — a "logged out" token remains usable until it naturally expires (60 minutes by default).
 - Auth rate limiting is in-memory and single-process — it does not protect a horizontally-scaled, multi-instance deployment (DECISIONS.md D25).
 - Frontend token storage (`localStorage`) is not XSS-resistant (DECISIONS.md D27).
