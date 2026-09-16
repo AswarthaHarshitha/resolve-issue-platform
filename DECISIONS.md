@@ -418,4 +418,88 @@ Scope rule to avoid AI undoing human decisions: if the issue is still `status=OP
 
 **Reasoning**: the project rules explicitly forbid "TODO-driven fake functionality." A stub `trigger_ai_analysis()` function that does nothing (or that always leaves the issue at `PENDING` forever) would be exactly that - dead weight Phase 5 would have to find and replace rather than a real extension point. The actual `BackgroundTasks.add_task(...)` call is added in Phase 5's `create_issue`, at the same time the `AIProvider` it calls is built - there's nothing correct to write here before that exists.
 
-**Status**: active. Superseded by Phase 5.
+**Status**: superseded by D33-D39 below, which implement exactly this.
+
+---
+
+## D33 — `ai_analysis_results` is built now, fulfilling D19's deferral
+
+**Context**: D19 (Phase 2) deliberately deferred this append-only AI-suggestion-history table, saying it "belongs with AI classification itself" — which, under the phase numbering active when D19 was written, was labeled "Phase 7." The project's phase plan was later renumbered (AI classification is now Phase 5), but the underlying intent - build this table when AI classification is actually implemented, not before - is unchanged.
+
+**Decision**: `ai_analysis_results` is added via its own migration (`07be6efb521f_add_ai_analysis_results`), append-only, one row per classification attempt (including manual reanalysis), with a `(issue_id, attempt_number)` unique constraint. It stores both the raw AI output (`raw_category`, `raw_sub_category`, `raw_priority`, even on a `FAILED` row - what the AI actually said, preserved for debugging/audit) and the validated, matched result (`matched_category_id`, `matched_sub_category_id`, `matched_priority` - only populated when validation succeeded). The composite-FK pattern from D17 is reused for `(matched_category_id, matched_sub_category_id)`, for the same reason: an invalid category/sub-category pairing must be impossible to store, even here.
+
+**Reasoning**: this is the correct moment to build it - AI classification exists now, so there's a real pipeline to attach history to and real behavior to verify against, rather than a speculative schema guessed at during Phase 2. Keeping both the raw and matched values means an admin (or a future debugging session) can always answer "what did the AI actually say, and why did we reject/accept it" from durable data alone.
+
+**Status**: active.
+
+---
+
+## D34 — `AIProvider`: structural validation only, OpenAI-compatible via configurable base URL
+
+**Context**: the provider must be swappable (no code path should be locked to one vendor), and needs to work with whichever OpenAI-compatible endpoint this deployment is configured for - in practice, verified live against Google's Gemini OpenAI-compatibility layer during this phase's manual testing, not just the real OpenAI API.
+
+**Decision**: `OpenAICompatibleProvider` wraps the `openai` Python SDK's `OpenAI` client with a configurable `base_url` (`OPENAI_BASE_URL`, unset = real OpenAI). `classify()` sends a system prompt instructing the model to return one JSON object with exactly five keys, parses the response, and validates only its *shape* against the `AISuggestion` Pydantic model (right fields, right types) - it has no database access and does not know what a "real" category is in this deployment. A network/timeout/API error raises `AIProviderError`; a response that doesn't parse into that shape raises `AIResponseFormatError`. Neither exception, nor a successful structural parse, implies the *content* is trustworthy - that's `ai_validation.py`'s job (D35), one layer up.
+
+**Reasoning**: this is the concrete implementation of D4/D10's "small, understandable `AIProvider` abstraction, no framework." Splitting structural validation (this module) from semantic validation (D35) keeps the provider genuinely swappable - a new provider only has to produce the same five JSON keys, not know anything about this deployment's category taxonomy. Verified live: a real call to Gemini succeeded and returned a structurally valid suggestion whose *category value* ("Network," a sub-category in this deployment's taxonomy, not a top-level category) was then correctly rejected by the semantic layer - concrete proof the two-layer split does its job, not just a claim.
+
+**Status**: active.
+
+---
+
+## D35 — Semantic AI validation: explicit normalization rules, no silent coercion
+
+**Context**: D5 requires the backend to never blindly trust the LLM's classification, while still allowing "explicit normalization" where it's genuinely safe.
+
+**Decision**: `validate_ai_suggestion` (`app/services/ai_validation.py`) applies exactly two explicit normalizations - case-insensitive matching for category/sub-category names, and case-insensitive matching for the priority string against the `IssuePriority` enum - and nothing beyond that. Three outcomes: (1) the category doesn't match any real, active category by name → hard failure (`AIValidationError`), the whole analysis is `FAILED`; (2) the category matches but the sub-category doesn't match anything under it → the sub-category is silently dropped (not a failure), since a correct broader classification is still useful even without the finer one; (3) the priority string doesn't match one of the four real values → hard failure, since priority feeds SLA lookup and escalation and a silent default would be worse than an honest failure.
+
+**Reasoning**: each of these three outcomes was a deliberate choice about where "helpful leniency" stops and "fabrication" begins. Category is the load-bearing field (it drives routing and SLA), so it gets zero tolerance beyond case-folding. Sub-category is optional supplementary detail, so losing it (not the whole classification) on a mismatch is the more useful failure mode. Priority has exactly four valid values with no reasonable "closest guess," so any value outside that set is rejected outright rather than mapped to a guessed default.
+
+**Status**: active.
+
+---
+
+## D36 — Deterministic priority escalation uses whole-word matching, not substring containment
+
+**Context**: `RoutingService.determine_final_priority` escalates the AI's suggested priority to at least `HIGH` when the issue text contains certain keywords ("outage," "down," etc.) - a deterministic backend rule that can override the AI's own judgment, per D4.
+
+**Decision**: keyword matching uses `\bkeyword\b` regex word-boundary matching, not `keyword in text` substring containment.
+
+**Reasoning**: this fixes a real bug caught by this phase's own test suite: a naive substring check made "dropdown," "showdown," and "downtown" all incorrectly trip the "down" keyword and escalate unrelated issues to `HIGH` priority. The regression is now a permanent test (`tests/test_routing_service.py::test_keyword_matching_is_whole_word_not_substring`) alongside the positive case, so this class of false positive can't silently return.
+
+**Status**: active.
+
+---
+
+## D37 — Background-task testability: injectable `provider` and `session_factory`
+
+**Context**: `run_ai_analysis` must, in production, call the real configured `AIProvider` and open its own session via the real `SessionLocal` (D4). Tests must do neither - a real network call in the test suite would be slow, flaky, potentially costly, and non-deterministic; and the real `SessionLocal` is bound to the *dev* database (`DATABASE_URL`), not the test suite's isolated `resolve_test` transaction, so using it directly would silently no-op against the wrong database.
+
+**Decision**: `run_ai_analysis(issue_id, provider=None, session_factory=None)` - both parameters default to the real production values (`get_default_provider()`, `SessionLocal`) when omitted, so the call site used by the actual API route (`background_tasks.add_task(run_ai_analysis, issue.id)`) is unchanged and unaware tests exist. Tests inject a `FakeAIProvider` (`tests/fake_ai_provider.py`) and a `session_factory` bound to the test transaction (`ai_session_factory` fixture in `conftest.py`, itself built on a new `db_connection` fixture exposing the raw connection so a second, independently-closeable `Session` can share the same test transaction without tearing down the one other fixtures still need).
+
+**Reasoning**: dependency injection with production-safe defaults is the standard way to make a side-effecting entry point testable without changing its production call signature or behavior. The alternative - monkeypatching module-level globals in tests - was rejected as fragile and implicit; explicit parameters make what's under test's control visible directly in the test's own code.
+
+**Status**: active.
+
+---
+
+## D38 — Manual reanalysis: access control, cooldown, and the OPEN-only routing scope rule, now implemented
+
+**Context**: D13 (from the original architecture review) specified the *policy* for `POST /issues/{id}/reanalyze` without implementing it. This phase is where that became real code.
+
+**Decision**: `request_reanalysis` (`app/services/ai_analysis_service.py`) enforces, in order: (1) caller must be `RESOLVER` or `ADMIN` (`ReanalyzeAccessDeniedError` → 403); (2) the issue must exist (404); (3) `ai_analysis_status` must not already be `PROCESSING` (`ReanalyzeInProgressError` → 409 - no duplicate concurrent analysis jobs); (4) the most recent `ai_analysis_results.created_at` must be older than `AI_REANALYZE_COOLDOWN_SECONDS` (default 120s) ago (`ReanalyzeCooldownError` → 429 with a `Retry-After` header). Only then does it flip `ai_analysis_status` to `PENDING` and return, for the route handler to schedule the same `run_ai_analysis` background task used by issue creation. Inside that task, `route_issue` (D31's guard) only actually re-routes the issue if it's still `OPEN`; on an issue that's already progressed further, reanalysis records a fresh `ai_analysis_results` row (a new attempt number, prior attempts untouched) without touching the issue's current category/team/priority/status at all - verified end to end by `test_reanalyze_on_already_routed_issue_does_not_re_route`.
+
+**Reasoning**: this is the concrete implementation of D13's promise that reanalysis is a genuine recovery mechanism (for D14's stuck-`PROCESSING`/crashed-task scenario) without ever letting the AI silently override a human's subsequent work on a routed issue.
+
+**Status**: active.
+
+---
+
+## D39 — Dev-only reference-data seed script
+
+**Context**: routing cannot do anything useful against empty `categories`/`teams`/`routing_rules`/`sla_rules` tables (Phase 2 deliberately left them empty - D16), but there is no admin-facing way to populate them yet (that's Phase 8). Without *something*, this phase's own manual verification - and any future local development - would have nothing to route against.
+
+**Decision**: `backend/scripts/seed_dev_reference_data.py`, run manually (`python -m scripts.seed_dev_reference_data`), never imported by any application or migration code. It refuses to run unless `ENVIRONMENT=development`, and is idempotent (checks for existing rows by name before inserting, so running it twice is harmless).
+
+**Reasoning**: this is exactly the "development-only seed mechanism... clearly isolated in an explicit development-only script" the project rules anticipate for cases where real configuration is genuinely required to exercise the system, as distinct from fake business data (users, issues), which this script never touches.
+
+**Status**: active. Superseded once Phase 8 adds a real admin-facing management UI for this configuration.

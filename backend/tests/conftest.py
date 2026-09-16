@@ -69,30 +69,40 @@ def test_engine(test_db_url):
 
 
 @pytest.fixture()
-def db_session(test_engine):
-    """Each test runs inside its own outer transaction, rolled back
-    afterward, so tests never leak fixture data into one another.
+def db_connection(test_engine):
+    """The raw connection+outer transaction underlying db_session, exposed
+    separately so a test can open an *additional*, independently
+    closeable Session on the same transaction - e.g. to call
+    run_ai_analysis with a session_factory that mimics "opens its own
+    session" (DECISIONS.md D4) without that session's close() call tearing
+    down the shared connection db_session and other fixtures still need."""
+    connection = test_engine.connect()
+    transaction = connection.begin()
+    try:
+        yield connection
+    finally:
+        if transaction.is_active:
+            transaction.rollback()
+        connection.close()
+
+
+@pytest.fixture()
+def db_session(db_connection):
+    """Each test runs inside its own outer transaction (db_connection),
+    rolled back afterward, so tests never leak fixture data into one
+    another.
 
     join_transaction_mode="create_savepoint" means application code that
     calls session.commit() (e.g. app/services/auth_service.py registering a
     user, which commits as part of a normal request) only ends a SAVEPOINT
     nested inside the outer transaction - a new savepoint starts
     automatically, and the outer transaction (and everything committed
-    inside it) is still fully discarded when this fixture rolls it back."""
-    connection = test_engine.connect()
-    transaction = connection.begin()
-    session: Session = Session(bind=connection, join_transaction_mode="create_savepoint")
-
+    inside it) is still fully discarded when db_connection rolls it back."""
+    session: Session = Session(bind=db_connection, join_transaction_mode="create_savepoint")
     try:
         yield session
     finally:
         session.close()
-        # A test that triggers an IntegrityError (e.g. asserting a constraint is
-        # enforced) leaves SQLAlchemy's own transaction already rolled back -
-        # only roll back here if that didn't already happen.
-        if transaction.is_active:
-            transaction.rollback()
-        connection.close()
 
 
 @pytest.fixture()
@@ -116,6 +126,20 @@ def client(db_session):
             yield test_client
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.fixture()
+def ai_session_factory(db_connection):
+    """A session_factory for run_ai_analysis()/request_reanalysis() that
+    shares the test's connection/transaction (so it sees data the test set
+    up via db_session/client, and vice versa) while still being a genuinely
+    separate Session object that run_ai_analysis's own `db.close()` can
+    safely close without affecting db_session."""
+
+    def factory() -> Session:
+        return Session(bind=db_connection, join_transaction_mode="create_savepoint")
+
+    return factory
 
 
 @pytest.fixture(autouse=True)

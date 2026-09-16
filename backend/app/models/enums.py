@@ -37,3 +37,12 @@ class StatusChangeTrigger(str, enum.Enum):
     AUTO_USER_REPLY = "AUTO_USER_REPLY"
     AI_ROUTING = "AI_ROUTING"
     ADMIN_OVERRIDE = "ADMIN_OVERRIDE"
+
+
+class AIAnalysisResultStatus(str, enum.Enum):
+    """Outcome of one classification attempt, recorded in
+    ai_analysis_results. Distinct from AIAnalysisStatus, which tracks the
+    issue's *current* AI pipeline state, not a specific attempt's outcome."""
+
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"

@@ -1,9 +1,10 @@
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.deps import get_current_user
 from app.db.session import get_db
 from app.models.enums import IssueStatus
@@ -14,20 +15,28 @@ from app.schemas.issue import (
     IssuePublic,
     IssueStatusUpdateRequest,
 )
-from app.services import issue_service
+from app.services import ai_analysis_service, issue_service
+from app.services.ai_analysis_service import run_ai_analysis
 
 router = APIRouter(prefix="/issues", tags=["issues"])
+settings = get_settings()
 
 
 @router.post("", response_model=IssuePublic, status_code=status.HTTP_201_CREATED)
 def create_issue(
     payload: IssueCreateRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> IssuePublic:
-    return issue_service.create_issue(
+    issue = issue_service.create_issue(
         db, owner=current_user, title=payload.title, description=payload.description
     )
+    # Issue creation has already committed and will return successfully
+    # regardless of what happens here - AI analysis runs after the response,
+    # in its own DB session (DECISIONS.md D1, D3, D4).
+    background_tasks.add_task(run_ai_analysis, issue.id)
+    return issue
 
 
 @router.get("", response_model=IssueListResponse)
@@ -84,3 +93,39 @@ def update_issue_status(
         )
     except issue_service.InvalidStatusTransitionError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post("/{issue_id}/reanalyze", response_model=IssuePublic, status_code=status.HTTP_202_ACCEPTED)
+def reanalyze_issue(
+    issue_id: UUID,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> IssuePublic:
+    try:
+        issue = ai_analysis_service.request_reanalysis(
+            db,
+            issue_id=issue_id,
+            current_user=current_user,
+            cooldown_seconds=settings.ai_reanalyze_cooldown_seconds,
+        )
+    except issue_service.IssueNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found")
+    except ai_analysis_service.ReanalyzeAccessDeniedError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to trigger reanalysis on this issue",
+        )
+    except ai_analysis_service.ReanalyzeInProgressError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="AI analysis is already in progress for this issue"
+        )
+    except ai_analysis_service.ReanalyzeCooldownError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Please wait {exc.retry_after_seconds} seconds before requesting another analysis",
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
+
+    background_tasks.add_task(run_ai_analysis, issue.id)
+    return issue

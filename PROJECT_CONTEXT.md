@@ -118,11 +118,14 @@ issues ─┬─< issue_comments >─ users (author)
                   └─< sla_pause_intervals
 ```
 
-**Deletion strategy** (DECISIONS.md D15): `RESTRICT` on every FK to a shared reference/config entity (roles, teams, categories, sub_categories, sla_rules, and every FK to `users`) — deactivate via `is_active` instead of deleting. `CASCADE` only for an issue's own owned-child rows (comments, status history, assignments, sla_records → sla_pause_intervals) — if an issue is ever deleted, its own history goes with it since nothing else references those rows.
+**AI history** (Phase 5):
+- `ai_analysis_results` — append-only, one row per classification attempt (including manual reanalysis): `issue_id` (FK, CASCADE), `attempt_number`, `status` (`COMPLETED|FAILED`), `raw_category`/`raw_sub_category`/`raw_priority`/`summary`/`reasoning` (exactly what the AI said, preserved even on failure), `matched_category_id`/`matched_sub_category_id`/`matched_priority` (populated only when validated — composite-FK checked against `sub_categories` exactly like `issues`/`routing_rules`), `error_message`. Unique on `(issue_id, attempt_number)`. Full reasoning in DECISIONS.md D33.
 
-**Intentionally deferred to later phases** (not built in Phase 2): `ai_analysis_results` (append-only AI suggestion history, referenced in earlier architecture discussion) belongs with AI classification in Phase 7, not the database foundation — Phase 2 only adds the `ai_analysis_status` column D2 requires. No production seed data beyond the three baseline roles (D16); categories/teams/routing/SLA rules are left empty for an admin-facing flow (or an explicitly isolated dev-only script) in a later phase.
+**Deletion strategy** (DECISIONS.md D15): `RESTRICT` on every FK to a shared reference/config entity (roles, teams, categories, sub_categories, sla_rules, and every FK to `users`) — deactivate via `is_active` instead of deleting. `CASCADE` only for an issue's own owned-child rows (comments, status history, assignments, sla_records → sla_pause_intervals, ai_analysis_results) — if an issue is ever deleted, its own history goes with it since nothing else references those rows.
 
-**Migrations**: Alembic, two revisions — `initial schema` (all 13 tables, constraints, indexes, the `btree_gist` extension) and `seed baseline roles`. `alembic upgrade head` / `alembic downgrade base` are both verified to run cleanly and repeatably against a real PostgreSQL database (not SQLite, not `create_all()` — the test suite runs actual migrations against a dedicated `resolve_test` database each session).
+**Reference/config data**: still no production seed data beyond the three baseline roles (D16); categories/teams/routing/SLA rules are populated in dev via an explicitly isolated, ENVIRONMENT-gated convenience script (`backend/scripts/seed_dev_reference_data.py`, DECISIONS.md D39) — never automatic, never production. An admin-facing management UI is Phase 8.
+
+**Migrations**: Alembic, three revisions — `initial schema` (13 tables, constraints, indexes, the `btree_gist` extension), `seed baseline roles`, and `add ai analysis results` (Phase 5). `alembic upgrade head` / `alembic downgrade base` are both verified to run cleanly and repeatably against a real PostgreSQL database (not SQLite, not `create_all()` — the test suite runs actual migrations against a dedicated `resolve_test` database each session).
 
 ## API ENDPOINTS
 - `GET /health` — liveness check, no auth. Returns `{status, environment}`.
@@ -130,10 +133,11 @@ issues ─┬─< issue_comments >─ users (author)
 - `POST /api/v1/auth/login` — public. Returns a JWT access token + safe user profile. Rate-limited.
 - `GET /api/v1/auth/me` — requires a valid JWT. Returns the caller's own profile (role, team) loaded fresh from the database.
 - `POST /api/v1/auth/logout` — requires a valid JWT. Stateless: confirms the request, invalidates nothing server-side (see DECISIONS.md D22).
-- `POST /api/v1/issues` — any authenticated user. Creates an issue (`status=OPEN`, `ai_analysis_status=PENDING`); no AI trigger yet (DECISIONS.md D32).
+- `POST /api/v1/issues` — any authenticated user. Creates an issue (`status=OPEN`, `ai_analysis_status=PENDING`), commits, returns, **then** schedules AI analysis as a background task (DECISIONS.md D3, D32 superseded by D33–D39).
 - `GET /api/v1/issues` — any authenticated user. Paginated, optional `status` filter. A `USER` only ever sees their own issues (forced server-side); `RESOLVER`/`ADMIN` see all (coarse-grained — DECISIONS.md D29).
 - `GET /api/v1/issues/{id}` — owner, or any `RESOLVER`/`ADMIN`. 404 if the issue doesn't exist, 403 if it exists but the caller can't see it.
 - `PATCH /api/v1/issues/{id}/status` — `RESOLVER`/`ADMIN` only. Validates the target against the D8 transition table using a freshly row-locked read (D12/D31); structurally cannot reach `CLOSED` (reserved for Phase 7's confirmation flow — D30).
+- `POST /api/v1/issues/{id}/reanalyze` — `RESOLVER`/`ADMIN` only. 404/403/409 (already `PROCESSING`)/429 (`Retry-After` header, cooldown) as appropriate; on success, `202` and a new background analysis attempt. Only re-routes if the issue is still `OPEN` (DECISIONS.md D13, D38).
 - `GET /api/v1/_rbac-demo/{user-only|resolver-only|admin-only|resolver-or-admin}` — still temporary. Kept alongside the issue endpoints because no issue endpoint is ADMIN-only or USER-only specifically, so this remains the only way to test those particular role combinations over real HTTP; will be removed once a real admin-only endpoint exists (e.g. Phase 8 admin management).
 
 Remaining endpoints defined in detail as later phases build them.
@@ -170,7 +174,7 @@ Client → POST /auth/register or /auth/login → FastAPI
 
 ## ISSUE LIFECYCLE (Phase 4 — implemented and tested)
 
-**Creation**: any authenticated user → `IssueCreateRequest` (title ≤200 chars, description ≤5000 chars, both required non-empty) → `issue_service.create_issue` inserts the issue (`status=OPEN`, `ai_analysis_status=PENDING` — column defaults, nothing actively sets them) and a `SYSTEM_CREATE` `issue_status_history` row in the same transaction → commit → return. No AI trigger exists yet — added in Phase 5 (DECISIONS.md D32).
+**Creation**: any authenticated user → `IssueCreateRequest` (title ≤200 chars, description ≤5000 chars, both required non-empty) → `issue_service.create_issue` inserts the issue (`status=OPEN`, `ai_analysis_status=PENDING` — column defaults, nothing actively sets them) and a `SYSTEM_CREATE` `issue_status_history` row in the same transaction → commit → return → **then** (Phase 5) the route schedules `run_ai_analysis` as a `BackgroundTask`.
 
 **Status transitions**: `PATCH /issues/{id}/status`, `RESOLVER`/`ADMIN` only. `app/services/status_transition_rules.py` holds the D8 allow-list as a pure, framework-agnostic function:
 ```
@@ -181,6 +185,43 @@ OPEN → TRIAGED → ASSIGNED → IN_PROGRESS ⇄ WAITING_FOR_USER → RESOLVED
 **Concurrency**: `issue_repository.get_issue_by_id_for_update` uses `SELECT ... FOR UPDATE` inside the transition transaction, so a concurrent transition request on the same issue blocks until the first commits, then validates against whatever that first request actually left behind — never a stale or client-supplied status (DECISIONS.md D12, D31). Verified with a real two-thread, two-connection test against a genuinely shared row, not the test suite's usual rollback-isolated session.
 
 **Authorization**: coarse-grained for now (DECISIONS.md D29) — a `USER` can only see their own issues (owner_id filter forced server-side, no way to request otherwise); `RESOLVER`/`ADMIN` can see and transition *any* issue, with no team-scoping yet since routing (Phase 5) is what will populate `current_team_id`, and Phase 7 is where resolver access narrows to "my team's issues only."
+
+## AI ANALYSIS & ROUTING (Phase 5 — implemented and tested)
+
+**Flow** (DECISIONS.md D1, D3, D4, D33–D39):
+```
+POST /issues → issue committed (OPEN/PENDING) → response returned
+  → BackgroundTask: run_ai_analysis(issue_id)
+    → own DB session (never the request's)
+    → ai_analysis_status = PROCESSING
+    → AIProvider.classify() → structural-only AISuggestion (or raises)
+    → ai_validation.validate_ai_suggestion() → semantic check against real
+      categories/sub_categories/priority (or raises AIValidationError)
+    → routing_service.route_issue() [only if issue.status == OPEN]:
+        final priority = AI suggestion + deterministic escalation keywords
+        category/sub_category set → OPEN→TRIAGED (history row)
+        routing_rules lookup → team found? → current_team_id set,
+          issue_assignments row, TRIAGED→ASSIGNED (history row)
+        sla_rules lookup → found? → sla_records row created
+    → ai_analysis_results row written (COMPLETED or FAILED, raw + matched)
+    → ai_analysis_status = COMPLETED
+  → any exception anywhere in this chain → ai_analysis_status = FAILED,
+    issue otherwise untouched, never a fabricated result
+```
+
+**AI is advisory only**: `AISuggestion` (`app/services/ai_provider.py`) has exactly five fields — `category, sub_category, priority, summary, reasoning` — no team, no role, no SLA, nothing capable of an authorization or routing decision even in principle (asserted directly by `test_ai_suggestion_has_no_authority_over_authorization_or_team_assignment`). `RoutingService` is the only code that decides final category/priority/team/SLA, and it's driven by database configuration (`routing_rules`, `sla_rules`), not a hardcoded chain.
+
+**Provider**: `OpenAICompatibleProvider`, configurable `OPENAI_BASE_URL` — verified live against both the real OpenAI shape and Google's Gemini OpenAI-compatibility endpoint during this phase's manual testing (DECISIONS.md D34).
+
+**Validation**: strict, with exactly two explicit normalizations (case-insensitive category/sub-category/priority matching) and no others — an unmatched category or priority is a hard `FAILED`, an unmatched sub-category degrades gracefully to "category only" (DECISIONS.md D35).
+
+**Deterministic priority escalation**: whole-word keyword matching (`\bkeyword\b`, not substring) bumps LOW/MEDIUM to HIGH for text containing "outage," "down," "cannot access," etc. — a real bug (naive substring matching falsely triggering on "dropdown") was caught by this phase's own tests and fixed (DECISIONS.md D36).
+
+**Missing configuration is never silently dropped**: no `routing_rule` for a category → issue stays `TRIAGED`, unassigned, fully visible (not `ASSIGNED`, not hidden). No `sla_rule` → analysis still `COMPLETED`, just no `sla_records` row. Both are treated as an operational configuration gap, not a failure of the issue or the AI.
+
+**Manual reanalysis**: `POST /issues/{id}/reanalyze`, resolver/admin only, cooldown-limited (429 + `Retry-After`), rejects if already `PROCESSING` (409). Only re-routes if the issue is still `OPEN`; on an already-progressed issue, it only records a fresh `ai_analysis_results` attempt without touching the issue (DECISIONS.md D13, D38).
+
+**Dev reference data**: `backend/scripts/seed_dev_reference_data.py` — explicit, `ENVIRONMENT=development`-gated, idempotent. The only way `routing_rules`/`sla_rules`/`categories` get populated before Phase 8's admin UI exists (DECISIONS.md D39).
 
 ## ARCHITECTURE
 Layered monolith (Option A, see DECISIONS.md): single FastAPI service, single React SPA, single Postgres database.
@@ -200,19 +241,19 @@ Never `User Issue → AI → blindly trust → persist`.
 **AI output validation is strict, not best-effort.** Pydantic schemas define exactly what a valid suggestion looks like (category/sub_category from the configured set, priority from the allowed enum, non-empty summary/reasoning). Malformed JSON, missing fields, or out-of-vocabulary values are never silently coerced into something plausible — the backend either normalizes through an explicitly supported mapping or marks the analysis `FAILED` and leaves the issue in its current business state for manual triage.
 
 ## IMPORTANT DECISIONS
-See DECISIONS.md for full reasoning. Summary: monolithic FastAPI + React (Option A) with FastAPI `BackgroundTasks` for AI chosen over a Celery/Redis worker split (Option B) and microservices (Option C) for MVP — revisit Option B only if AI load or retry guarantees demand it. AI processing state (`ai_analysis_status`) is kept strictly separate from the issue business lifecycle (`status`). No LangChain/RAG/vector DB/agent framework is used — the `AIProvider` is a plain, understandable abstraction over an OpenAI-compatible API. Database (Phase 2): UUIDv4 keys everywhere, RESTRICT-vs-CASCADE deletion split, composite FKs for category/sub-category integrity, and a GiST exclusion constraint for SLA pause intervals — see D15–D19. Auth (Phase 3): JWT carries no role claim, role/is_active always reloaded from the database per request, stateless logout, localStorage token storage, in-memory single-process rate limiting — see D20–D28. Issues (Phase 4): coarse-grained owner/staff authorization, `SELECT FOR UPDATE`-backed transition validation, RESOLVED→CLOSED structurally blocked until Phase 7, no AI-trigger stub — see D29–D32.
+See DECISIONS.md for full reasoning. Summary: monolithic FastAPI + React (Option A) with FastAPI `BackgroundTasks` for AI chosen over a Celery/Redis worker split (Option B) and microservices (Option C) for MVP — revisit Option B only if AI load or retry guarantees demand it. AI processing state (`ai_analysis_status`) is kept strictly separate from the issue business lifecycle (`status`). No LangChain/RAG/vector DB/agent framework is used — the `AIProvider` is a plain, understandable abstraction over an OpenAI-compatible API. Database (Phase 2): UUIDv4 keys everywhere, RESTRICT-vs-CASCADE deletion split, composite FKs for category/sub-category integrity, and a GiST exclusion constraint for SLA pause intervals — see D15–D19. Auth (Phase 3): JWT carries no role claim, role/is_active always reloaded from the database per request, stateless logout, localStorage token storage, in-memory single-process rate limiting — see D20–D28. Issues (Phase 4): coarse-grained owner/staff authorization, `SELECT FOR UPDATE`-backed transition validation, RESOLVED→CLOSED structurally blocked until Phase 7 — see D29–D32. AI/routing (Phase 5): `ai_analysis_results` built now, structural-vs-semantic validation split, whole-word priority-escalation matching, injectable provider/session for testability, reanalyze cooldown/scope rules, dev-only reference-data seed — see D33–D39.
 
 ## KNOWN BUGS
-None currently known.
+None currently known. (One real bug — naive substring keyword matching in priority escalation — was found and fixed during Phase 5; see DECISIONS.md D36. Not currently open.)
 
 ## CURRENT STATUS
-Phase 4 (issue creation + core lifecycle) complete, on top of Phases 2–3. Architecture approved by the developer through four rounds of clarification (D1–D14), the database layer (D15–D19), authentication/RBAC (D20–D28), and now the issue domain (D29–D32) — all in DECISIONS.md.
+Phase 5 (AI provider + deterministic routing) complete, on top of Phases 2–4. Architecture approved by the developer through four rounds of clarification (D1–D14), the database layer (D15–D19), authentication/RBAC (D20–D28), the issue domain (D29–D32), and now AI/routing (D33–D39) — all in DECISIONS.md.
 
-Verified working: 115 pytest tests passing (40 database + 47 auth/RBAC + 28 issue creation/retrieval/transitions, including a genuine two-thread/two-connection concurrency test), all against a real PostgreSQL database; issue creation/listing/status-transition behavior manually verified via curl against both a host-run backend and the full Docker Compose stack; frontend still builds and boots unaffected (no issue UI yet — that's Phase 8). The frontend's interactive behavior remains verified only via HTTP status codes and a successful build/boot, not a real browser (no browser-automation tool available in this session).
+Verified working: 142 pytest tests passing (40 database + 47 auth/RBAC + 28 issue domain + 27 AI/routing/reanalyze, including a fake-provider-driven end-to-end pipeline test and a whole-word-matching regression test), all against a real PostgreSQL database; the full pipeline was also verified **live against the real configured Gemini provider** (via its OpenAI-compatible endpoint) — a real network call succeeded, returned a plausible-but-wrong category name, was correctly rejected by strict validation (`FAILED`, no fabrication), and a subsequent reanalysis after a prompt refinement succeeded end-to-end: real classification → validation → routing → team assignment → SLA record creation, all confirmed via direct database inspection. Frontend still builds and boots unaffected (no issue UI yet — Phase 8).
 
 ## PENDING TASKS
-- Phase 5: AI provider abstraction + deterministic routing (the AI-trigger wiring `create_issue` doesn't have yet, `RoutingService`, `routing_rules`/`sla_rules` lookups, manual reanalysis).
-- Phases 6–11: SLA engine → comments/assignments/resolver workflow (incl. RESOLVED→CLOSED confirmation) → dashboards/admin → security attack pass → production deployment.
+- Phase 6: SLA engine (pause/resume mechanics on top of the `sla_records`/`sla_pause_intervals` schema built in Phase 2, effective-elapsed/at-risk/breach computation).
+- Phases 7–11: comments/assignments/resolver workflow (incl. RESOLVED→CLOSED confirmation) → dashboards/admin → security attack pass → production deployment.
 
 ## CONSTRAINTS
 - No SQLite as a Postgres substitute, anywhere.

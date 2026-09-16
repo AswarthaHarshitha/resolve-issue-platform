@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     ai_provider: str = "openai"
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    # Any OpenAI-compatible endpoint - e.g. Google's Gemini offers one at
+    # https://generativelanguage.googleapis.com/v1beta/openai/. Unset means
+    # the real OpenAI API (the SDK's own default).
+    openai_base_url: Optional[str] = None
+
+    ai_reanalyze_cooldown_seconds: int = 120
 
     @property
     def cors_origins_list(self) -> list[str]:
