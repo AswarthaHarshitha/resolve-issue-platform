@@ -1,11 +1,14 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from app.models.enums import AIAnalysisStatus, IssuePriority, IssueStatus
 from app.schemas.user import TeamPublic
+
+if TYPE_CHECKING:
+    from app.models.issue import Issue
 
 _TITLE_MAX_LENGTH = 200
 _DESCRIPTION_MAX_LENGTH = 5000
@@ -62,6 +65,25 @@ class IssueCreateRequest(BaseModel):
         return value
 
 
+class SLAStatusPublic(BaseModel):
+    """Computed, not stored - see app/services/sla_service.py. Every field
+    here is deterministically reconstructable from sla_records/
+    sla_pause_intervals alone (DECISIONS.md D40), so this is always
+    reproducible after a restart, never dependent on in-memory state."""
+
+    first_response_deadline_at: datetime
+    resolution_deadline_at: datetime
+    effective_elapsed_seconds: int
+    accumulated_pause_seconds: int
+    is_paused: bool
+    first_response_met: bool
+    resolution_met: bool
+    first_response_at_risk: bool
+    first_response_breached: bool
+    resolution_at_risk: bool
+    resolution_breached: bool
+
+
 class IssuePublic(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -76,10 +98,37 @@ class IssuePublic(BaseModel):
     owner: UserSummary
     current_team: Optional[TeamPublic] = None
     current_resolver: Optional[UserSummary] = None
+    sla: Optional[SLAStatusPublic] = None
     created_at: datetime
     updated_at: datetime
     resolved_at: Optional[datetime] = None
     closed_at: Optional[datetime] = None
+
+
+def build_issue_public(issue: "Issue") -> IssuePublic:
+    """The one place an Issue ORM object becomes an IssuePublic response -
+    used by every route that returns an issue, so `sla` (computed, not a
+    plain ORM attribute IssuePublic.model_validate could pick up on its own)
+    is never forgotten on one endpoint but not another."""
+    from app.services.sla_service import compute_sla_status
+
+    public = IssuePublic.model_validate(issue)
+    if issue.sla_record is not None:
+        status = compute_sla_status(issue.sla_record)
+        public.sla = SLAStatusPublic(
+            first_response_deadline_at=status.first_response_deadline_at,
+            resolution_deadline_at=status.resolution_deadline_at,
+            effective_elapsed_seconds=status.effective_elapsed_seconds,
+            accumulated_pause_seconds=status.accumulated_pause_seconds,
+            is_paused=status.is_paused,
+            first_response_met=status.first_response_met,
+            resolution_met=status.resolution_met,
+            first_response_at_risk=status.first_response_at_risk,
+            first_response_breached=status.first_response_breached,
+            resolution_at_risk=status.resolution_at_risk,
+            resolution_breached=status.resolution_breached,
+        )
+    return public
 
 
 class IssueListResponse(BaseModel):

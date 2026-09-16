@@ -503,3 +503,18 @@ Scope rule to avoid AI undoing human decisions: if the issue is still `status=OP
 **Reasoning**: this is exactly the "development-only seed mechanism... clearly isolated in an explicit development-only script" the project rules anticipate for cases where real configuration is genuinely required to exercise the system, as distinct from fake business data (users, issues), which this script never touches.
 
 **Status**: active. Superseded once Phase 8 adds a real admin-facing management UI for this configuration.
+
+---
+
+## D40 — SLA engine: pause/resume wired into the transition endpoint, pure DB-reconstructable computation
+
+**Context**: the SLA schema (`sla_records`, `sla_pause_intervals`, the exclusion constraint) was built in Phase 2 (D19), and Phase 5's `RoutingService` already creates the initial `sla_records` row with fixed deadlines when routing succeeds. What was still missing: actually opening/closing pause windows when an issue enters/leaves `WAITING_FOR_USER`, and computing effective elapsed time, at-risk state, and breach state from that data.
+
+**Decision**: `app/services/sla_service.py` adds two write operations and one pure read computation:
+- `open_pause`/`close_pause` are called from inside `issue_service.transition_status`, in the same row-locked transaction as the status change itself - entering `WAITING_FOR_USER` opens a pause, leaving it (`WAITING_FOR_USER → IN_PROGRESS`) closes it and folds the duration into `sla_records.accumulated_pause_seconds`. Nothing about *when* to pause/resume lives outside this one call site tied to the state machine.
+- `compute_sla_status(sla_record, now=...)` is a pure function: given an `SLARecord` with its `pause_intervals` loaded, it returns effective elapsed time, remaining time, and at-risk/breached flags for both the first-response and resolution targets, independently of each other. "At risk" is `remaining_time <= SLA_AT_RISK_THRESHOLD_FRACTION * original_duration` (default 20%) - a fixed, documented, configurable fraction, not a guess. The function takes no dependency on wall-clock time except through its `now` parameter, and no dependency on anything held in Python process memory - it was tested (`test_reconstructs_correctly_from_a_freshly_loaded_record_simulating_a_restart`) by computing against a record, discarding all in-memory state (`session.expire_all()`), reloading it fresh, and confirming an identical result.
+- `IssuePublic.sla` (via a new `build_issue_public()` helper used by every issue-returning endpoint) exposes this computed status over the API - `first_response_deadline_at`, `resolution_deadline_at`, `effective_elapsed_seconds`, `accumulated_pause_seconds`, `is_paused`, and the four at-risk/breached booleans.
+
+**Reasoning**: this directly satisfies the Phase 6 auditability requirement ("a future administrator must be able to answer 'why was this issue considered breached' from persisted data") - every number `compute_sla_status` produces is derived from columns that exist in the database, nothing is cached or computed once and forgotten. Wiring pause/resume into the same transaction as the triggering status change (rather than as a separate step) means the two can never drift apart, the same principle already established for AI routing (D40 continues D19's "no event sourcing, a small durable relational design is enough" stance) - the database's exclusion constraint from D19 remains the final backstop, and this phase's own concurrency test (`test_concurrent_waiting_for_user_entry_opens_exactly_one_pause`, real threads/connections, not the SAVEPOINT-isolated fixture) confirms the row lock inherited from D12/D31 prevents a double-open before that constraint would even need to fire.
+
+**Status**: active.

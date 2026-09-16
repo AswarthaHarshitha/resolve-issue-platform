@@ -39,6 +39,11 @@ class Settings(BaseSettings):
 
     ai_reanalyze_cooldown_seconds: int = 120
 
+    # An SLA target is "at risk" once remaining time drops to this fraction
+    # (or less) of the original duration - e.g. 0.2 = the last 20% of the
+    # window. Deterministic, backend-only - see DECISIONS.md D40.
+    sla_at_risk_threshold_fraction: float = 0.2
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_allow_origins.split(",") if origin.strip()]

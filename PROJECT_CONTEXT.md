@@ -223,6 +223,24 @@ POST /issues → issue committed (OPEN/PENDING) → response returned
 
 **Dev reference data**: `backend/scripts/seed_dev_reference_data.py` — explicit, `ENVIRONMENT=development`-gated, idempotent. The only way `routing_rules`/`sla_rules`/`categories` get populated before Phase 8's admin UI exists (DECISIONS.md D39).
 
+## SLA ENGINE (Phase 6 — implemented and tested)
+
+**Pause/resume**: wired directly into `issue_service.transition_status` (DECISIONS.md D40) — entering `WAITING_FOR_USER` calls `sla_service.open_pause`; leaving it (`WAITING_FOR_USER → IN_PROGRESS`) calls `sla_service.close_pause`, both inside the same row-locked transaction as the status change itself, so a pause and its triggering transition can never drift apart. `close_pause` folds the closed interval's duration into `sla_records.accumulated_pause_seconds` (the D19 cache); `sla_pause_intervals` remains the source of truth.
+
+**Computation**: `sla_service.compute_sla_status(sla_record, now=...)` — a pure function, no side effects, no reliance on anything held in process memory. Given `sla_record` with its `pause_intervals` loaded, it returns:
+```
+effective_elapsed = (now - sla_started_at) - accumulated_pause_seconds - (open pause's running duration, if any)
+first_response_remaining = first_response_target_duration - effective_elapsed
+resolution_remaining     = resolution_target_duration - effective_elapsed
+at_risk   = 0 < remaining <= SLA_AT_RISK_THRESHOLD_FRACTION * target_duration   (default 20%)
+breached  = remaining <= 0 (and not already "met")
+```
+Verified to reconstruct identically after a simulated restart (`session.expire_all()` + fresh reload) — proving no hidden in-memory state.
+
+**API exposure**: every issue-returning endpoint (`create`, `get`, `list`, `PATCH .../status`) includes a computed `sla` object via a shared `build_issue_public()` helper (`first_response_deadline_at`, `resolution_deadline_at`, `effective_elapsed_seconds`, `accumulated_pause_seconds`, `is_paused`, and the four at-risk/breached booleans) — `null` if the issue was never routed to an `sla_rule`.
+
+**Concurrency**: entering `WAITING_FOR_USER` inherits the same `SELECT ... FOR UPDATE` serialization as every other transition (D12/D31) — verified with a real two-thread/two-connection test that only one of two simultaneous `IN_PROGRESS → WAITING_FOR_USER` requests can succeed, and exactly one pause interval is ever opened. The database's exclusion constraint (D19) remains the final backstop.
+
 ## ARCHITECTURE
 Layered monolith (Option A, see DECISIONS.md): single FastAPI service, single React SPA, single Postgres database.
 Backend layout: `app/{main, api, core, models, schemas, services, repositories, db, tests}`.
@@ -241,19 +259,19 @@ Never `User Issue → AI → blindly trust → persist`.
 **AI output validation is strict, not best-effort.** Pydantic schemas define exactly what a valid suggestion looks like (category/sub_category from the configured set, priority from the allowed enum, non-empty summary/reasoning). Malformed JSON, missing fields, or out-of-vocabulary values are never silently coerced into something plausible — the backend either normalizes through an explicitly supported mapping or marks the analysis `FAILED` and leaves the issue in its current business state for manual triage.
 
 ## IMPORTANT DECISIONS
-See DECISIONS.md for full reasoning. Summary: monolithic FastAPI + React (Option A) with FastAPI `BackgroundTasks` for AI chosen over a Celery/Redis worker split (Option B) and microservices (Option C) for MVP — revisit Option B only if AI load or retry guarantees demand it. AI processing state (`ai_analysis_status`) is kept strictly separate from the issue business lifecycle (`status`). No LangChain/RAG/vector DB/agent framework is used — the `AIProvider` is a plain, understandable abstraction over an OpenAI-compatible API. Database (Phase 2): UUIDv4 keys everywhere, RESTRICT-vs-CASCADE deletion split, composite FKs for category/sub-category integrity, and a GiST exclusion constraint for SLA pause intervals — see D15–D19. Auth (Phase 3): JWT carries no role claim, role/is_active always reloaded from the database per request, stateless logout, localStorage token storage, in-memory single-process rate limiting — see D20–D28. Issues (Phase 4): coarse-grained owner/staff authorization, `SELECT FOR UPDATE`-backed transition validation, RESOLVED→CLOSED structurally blocked until Phase 7 — see D29–D32. AI/routing (Phase 5): `ai_analysis_results` built now, structural-vs-semantic validation split, whole-word priority-escalation matching, injectable provider/session for testability, reanalyze cooldown/scope rules, dev-only reference-data seed — see D33–D39.
+See DECISIONS.md for full reasoning. Summary: monolithic FastAPI + React (Option A) with FastAPI `BackgroundTasks` for AI chosen over a Celery/Redis worker split (Option B) and microservices (Option C) for MVP — revisit Option B only if AI load or retry guarantees demand it. AI processing state (`ai_analysis_status`) is kept strictly separate from the issue business lifecycle (`status`). No LangChain/RAG/vector DB/agent framework is used — the `AIProvider` is a plain, understandable abstraction over an OpenAI-compatible API. Database (Phase 2): UUIDv4 keys everywhere, RESTRICT-vs-CASCADE deletion split, composite FKs for category/sub-category integrity, and a GiST exclusion constraint for SLA pause intervals — see D15–D19. Auth (Phase 3): JWT carries no role claim, role/is_active always reloaded from the database per request, stateless logout, localStorage token storage, in-memory single-process rate limiting — see D20–D28. Issues (Phase 4): coarse-grained owner/staff authorization, `SELECT FOR UPDATE`-backed transition validation, RESOLVED→CLOSED structurally blocked until Phase 7 — see D29–D32. AI/routing (Phase 5): `ai_analysis_results` built now, structural-vs-semantic validation split, whole-word priority-escalation matching, injectable provider/session for testability, reanalyze cooldown/scope rules, dev-only reference-data seed — see D33–D39. SLA (Phase 6): pause/resume atomic with the triggering transition, pure DB-reconstructable computation, 20%-remaining at-risk threshold — see D40.
 
 ## KNOWN BUGS
 None currently known. (One real bug — naive substring keyword matching in priority escalation — was found and fixed during Phase 5; see DECISIONS.md D36. Not currently open.)
 
 ## CURRENT STATUS
-Phase 5 (AI provider + deterministic routing) complete, on top of Phases 2–4. Architecture approved by the developer through four rounds of clarification (D1–D14), the database layer (D15–D19), authentication/RBAC (D20–D28), the issue domain (D29–D32), and now AI/routing (D33–D39) — all in DECISIONS.md.
+Phase 6 (SLA engine) complete, on top of Phases 2–5. Architecture approved by the developer through four rounds of clarification (D1–D14), the database layer (D15–D19), authentication/RBAC (D20–D28), the issue domain (D29–D32), AI/routing (D33–D39), and now the SLA engine (D40) — all in DECISIONS.md.
 
-Verified working: 142 pytest tests passing (40 database + 47 auth/RBAC + 28 issue domain + 27 AI/routing/reanalyze, including a fake-provider-driven end-to-end pipeline test and a whole-word-matching regression test), all against a real PostgreSQL database; the full pipeline was also verified **live against the real configured Gemini provider** (via its OpenAI-compatible endpoint) — a real network call succeeded, returned a plausible-but-wrong category name, was correctly rejected by strict validation (`FAILED`, no fabrication), and a subsequent reanalysis after a prompt refinement succeeded end-to-end: real classification → validation → routing → team assignment → SLA record creation, all confirmed via direct database inspection. Frontend still builds and boots unaffected (no issue UI yet — Phase 8).
+Verified working: 157 pytest tests passing (40 database + 47 auth/RBAC + 28 issue domain + 27 AI/routing/reanalyze + 15 SLA, including a restart-simulation test and a real concurrency test for simultaneous `WAITING_FOR_USER` entry), all against a real PostgreSQL database; the full pause/resume cycle was also verified **live** against a real routed issue — a real ~18-second `WAITING_FOR_USER` window was correctly excluded from `effective_elapsed_seconds` and correctly reflected in `accumulated_pause_seconds` after resuming, confirmed via the API response itself, not just direct database inspection. Frontend still builds and boots unaffected (no issue UI yet — Phase 8).
 
 ## PENDING TASKS
-- Phase 6: SLA engine (pause/resume mechanics on top of the `sla_records`/`sla_pause_intervals` schema built in Phase 2, effective-elapsed/at-risk/breach computation).
-- Phases 7–11: comments/assignments/resolver workflow (incl. RESOLVED→CLOSED confirmation) → dashboards/admin → security attack pass → production deployment.
+- Phase 7: comments, assignments/reassignment, resolver workflow (incl. the atomic auto-resume-on-owner-reply rule for `WAITING_FOR_USER`, and the dedicated `RESOLVED → CLOSED` user-confirmation flow).
+- Phases 8–11: dashboards/admin → security attack pass → production deployment.
 
 ## CONSTRAINTS
 - No SQLite as a Postgres substitute, anywhere.

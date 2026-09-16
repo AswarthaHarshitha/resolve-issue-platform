@@ -21,6 +21,7 @@ from app.models.issue import Issue
 from app.models.issue_status_history import IssueStatusHistory
 from app.models.user import User
 from app.repositories import issue_repository
+from app.services import sla_service
 from app.services.status_transition_rules import is_transition_allowed
 
 _STAFF_ROLES = (RoleName.RESOLVER, RoleName.ADMIN)
@@ -116,6 +117,15 @@ def transition_status(
     issue.status = target_status
     if target_status == IssueStatus.RESOLVED:
         issue.resolved_at = datetime.now(timezone.utc)
+
+    # SLA pause/resume is atomic with the status change that causes it - it
+    # happens inside the same row-locked transaction as the transition
+    # itself, so the two can never drift apart (DECISIONS.md D40).
+    if issue.sla_record is not None:
+        if target_status == IssueStatus.WAITING_FOR_USER:
+            sla_service.open_pause(db, issue.sla_record)
+        elif previous_status == IssueStatus.WAITING_FOR_USER and target_status == IssueStatus.IN_PROGRESS:
+            sla_service.close_pause(db, issue.sla_record)
 
     db.add(
         IssueStatusHistory(

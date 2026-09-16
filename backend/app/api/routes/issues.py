@@ -14,6 +14,7 @@ from app.schemas.issue import (
     IssueListResponse,
     IssuePublic,
     IssueStatusUpdateRequest,
+    build_issue_public,
 )
 from app.services import ai_analysis_service, issue_service
 from app.services.ai_analysis_service import run_ai_analysis
@@ -36,7 +37,7 @@ def create_issue(
     # regardless of what happens here - AI analysis runs after the response,
     # in its own DB session (DECISIONS.md D1, D3, D4).
     background_tasks.add_task(run_ai_analysis, issue.id)
-    return issue
+    return build_issue_public(issue)
 
 
 @router.get("", response_model=IssueListResponse)
@@ -50,7 +51,9 @@ def list_issues(
     items, total = issue_service.list_issues_for_user(
         db, current_user=current_user, page=page, page_size=page_size, status_filter=status_filter
     )
-    return IssueListResponse(items=items, total=total, page=page, page_size=page_size)
+    return IssueListResponse(
+        items=[build_issue_public(item) for item in items], total=total, page=page, page_size=page_size
+    )
 
 
 @router.get("/{issue_id}", response_model=IssuePublic)
@@ -60,7 +63,8 @@ def get_issue(
     db: Session = Depends(get_db),
 ) -> IssuePublic:
     try:
-        return issue_service.get_issue_for_user(db, issue_id=issue_id, current_user=current_user)
+        issue = issue_service.get_issue_for_user(db, issue_id=issue_id, current_user=current_user)
+        return build_issue_public(issue)
     except issue_service.IssueNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found")
     except issue_service.IssueAccessDeniedError:
@@ -77,13 +81,14 @@ def update_issue_status(
     db: Session = Depends(get_db),
 ) -> IssuePublic:
     try:
-        return issue_service.transition_status(
+        issue = issue_service.transition_status(
             db,
             issue_id=issue_id,
             target_status=payload.status,
             current_user=current_user,
             note=payload.note,
         )
+        return build_issue_public(issue)
     except issue_service.IssueNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found")
     except issue_service.IssueAccessDeniedError:
@@ -128,4 +133,4 @@ def reanalyze_issue(
         )
 
     background_tasks.add_task(run_ai_analysis, issue.id)
-    return issue
+    return build_issue_public(issue)
