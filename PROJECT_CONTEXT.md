@@ -57,10 +57,10 @@ Role-based authorization is enforced on the backend for every endpoint; the fron
 - Email/push notifications are out of scope for MVP; status changes are visible in-app only. Flagged as a future improvement.
 - Status transitions are restricted to an explicit allow-list enforced server-side (`OPEN→TRIAGED`, `TRIAGED→ASSIGNED`, `ASSIGNED→IN_PROGRESS`, `IN_PROGRESS→WAITING_FOR_USER`, `WAITING_FOR_USER→IN_PROGRESS`, `IN_PROGRESS→RESOLVED`, `RESOLVED→CLOSED`); every accepted transition writes an `issue_status_history` row. The frontend cannot cause a transition the backend doesn't independently validate.
 - `RESOLVED → CLOSED` is never automatic. A resolver moving an issue to `RESOLVED` attaches resolution details; only the original submitter's explicit confirmation closes it. A rejected resolution returns the issue to an active state per the same transition table (not an arbitrary status). Any admin override of this confirmation step is itself a deterministic, explicitly coded rule and is recorded in `issue_status_history` like any other transition — never a silent bypass.
-- SLA "pause" while `WAITING_FOR_USER` is modeled explicitly, not just implied by a fixed deadline: entering `WAITING_FOR_USER` opens a row in `sla_pauses`; leaving it closes that row and folds the elapsed pause duration into `sla_records.accumulated_pause_seconds`. At-risk/breach checks compare `now()` against `deadline + accumulated_pause_seconds + (elapsed time of any currently-open pause)` — i.e. the effective deadline is extended by exactly however long the clock was paused. Fully backend-computed; the LLM is never involved.
+- SLA "pause" while `WAITING_FOR_USER` is modeled explicitly, not just implied by a fixed deadline: entering `WAITING_FOR_USER` opens a row in `sla_pause_intervals`; leaving it closes that row and folds the elapsed pause duration into `sla_records.accumulated_pause_seconds`. At-risk/breach checks compare `now()` against `deadline + accumulated_pause_seconds + (elapsed time of any currently-open pause)` — i.e. the effective deadline is extended by exactly however long the clock was paused. Fully backend-computed; the LLM is never involved. The database itself (not just application logic) forbids overlapping or backwards pause intervals — see DECISIONS.md D19.
 - A user's comment on an issue currently `WAITING_FOR_USER` automatically transitions it back to `IN_PROGRESS`, but only when the commenter is the issue's own submitting user — a resolver/admin commenting does not trigger it. The comment insert, the status update, the `issue_status_history` row (`trigger=auto_user_reply`), and the matching SLA-pause close all happen in one backend transaction, so the pause and the status can never drift apart.
 - Status-transition endpoints never accept a client-supplied "current status" as truth. The handler loads the issue row with a row lock (`SELECT ... FOR UPDATE`) inside the transaction, validates the requested target against the allow-list using that freshly-read status, and only then updates — so two concurrent requests are serialized and the second one is judged against what the first one actually left behind, not against whatever the frontend last rendered.
-- `POST /issues/{id}/reanalyze` (resolver-on-team or admin only) sets `ai_analysis_status=PENDING`, inserts a new `ai_analysis_results` row on completion (never overwrites a prior one), and is cooldown-limited (a fixed minimum interval since the last attempt) to prevent abuse. If the issue is still `OPEN` (never successfully routed), reanalysis behaves exactly like the original pipeline and can apply routing/SLA. If the issue has already progressed past `OPEN` (meaning it was routed and possibly hand-adjusted by a human), reanalysis only records a fresh AI opinion for review — it never silently re-routes or re-prioritizes an issue a human has already acted on.
+- `POST /issues/{id}/reanalyze` (resolver-on-team or admin only) sets `ai_analysis_status=PENDING`, inserts a new `ai_analysis_results` row on completion (never overwrites a prior one), and is cooldown-limited (a fixed minimum interval since the last attempt) to prevent abuse. If the issue is still `OPEN` (never successfully routed), reanalysis behaves exactly like the original pipeline and can apply routing/SLA. If the issue has already progressed past `OPEN` (meaning it was routed and possibly hand-adjusted by a human), reanalysis only records a fresh AI opinion for review — it never silently re-routes or re-prioritizes an issue a human has already acted on. (`ai_analysis_results` itself is a Phase 7 table, not built in Phase 2 — see the DATABASE section.)
 
 ## TECH STACK
 - **Frontend**: React, TypeScript, Vite, Tailwind CSS.
@@ -71,17 +71,58 @@ Role-based authorization is enforced on the backend for every endpoint; the fron
 - **Infra**: Docker, docker-compose for local dev.
 - **Testing**: pytest (backend), targeted frontend tests.
 
-## DATABASE (initial shape — finalized in Phase 2)
-Core tables: `users`, `roles`, `teams`, `categories` (+ `sub_categories`), `routing_rules`, `sla_rules`, `issues`, `issue_comments`, `issue_status_history`, `issue_assignments`, `sla_records`.
-All tables carry `created_at`/`updated_at`; foreign keys and indexes added where lookups are frequent (issue owner, assigned team, status, priority).
+## DATABASE (Phase 2 — implemented and tested)
 
-`issues` carries two independent state fields: `status` (business lifecycle, server-transition-validated) and `ai_analysis_status` (`PENDING | PROCESSING | COMPLETED | FAILED`, mirroring the latest row in `ai_analysis_results`). The backend's final decision (final category/sub_category/priority/team) lives on `issues` itself; every AI *suggestion* that led to it — including retries — is preserved separately, so what the AI proposed and what the system actually did are both auditable. All SLA/assignment/status timestamps are stored in UTC.
+13 tables, all with UUIDv4 primary keys (DECISIONS.md D15). Every table has `created_at`; mutable tables (config/business rows) also have `updated_at`. All timestamp columns are `TIMESTAMP WITH TIME ZONE`, written in UTC.
 
-Two additional tables support the clarifications below:
-- **`ai_analysis_results`** (append-only): `id, issue_id, attempt_number, status (COMPLETED|FAILED), category, sub_category, suggested_priority, summary, reasoning, error_message, created_at`. Each classification attempt — including manual reanalysis — inserts a new row instead of overwriting the last one, so prior AI opinions on an issue stay queryable.
-- **`sla_pauses`**: `id, sla_record_id, paused_at, resumed_at (nullable), created_at`. At most one open row (`resumed_at IS NULL`) per SLA record at a time. `sla_records` gains `accumulated_pause_seconds` (running total, updated when a pause closes) alongside its fixed `first_response_deadline_at` / `resolution_deadline_at`.
+**Reference/config data** (admin-managed, never hardcoded in application logic):
+- `roles` — `name` (unique). Seeded with `USER`/`RESOLVER`/`ADMIN` by an Alembic migration, not application code (DECISIONS.md D16).
+- `teams` — `name` (unique), `description`, `is_active`.
+- `categories` — `name` (unique), `description`, `is_active`.
+- `sub_categories` — `category_id` (FK, RESTRICT), `name`, `is_active`. Unique on `(category_id, name)`. Also carries `UNIQUE(category_id, id)` solely so other tables can hold a composite FK back to a specific (category, sub_category) pair — see `routing_rules`/`issues` below and DECISIONS.md D17.
+- `routing_rules` — `category_id` (FK), `sub_category_id` (nullable FK, composite with `category_id` into `sub_categories`), `team_id` (FK), `is_active`. Two partial unique indexes prevent duplicate rules: one category-wide catch-all per category (`sub_category_id IS NULL`), one per specific sub-category (`sub_category_id IS NOT NULL`) — a plain unique constraint can't express this because SQL treats `NULL`s as distinct from each other.
+- `sla_rules` — `category_id` (FK), `priority`, `first_response_minutes`, `resolution_minutes`, `is_active`. Unique on `(category_id, priority)`. Durations, not fixed deadlines — the deadline is computed once, when an `sla_records` row is created.
 
-`issue_status_history` gains a `trigger` field (`manual | auto_user_reply | ai_routing | admin_override`) alongside `changed_by` (nullable — automated transitions have no human actor) so every status change is traceable to why it happened, not just what changed.
+**Users**:
+- `users` — `email` (unique), `password_hash`, `full_name`, `is_active`, `role_id` (FK, RESTRICT), `team_id` (nullable FK, RESTRICT). Whether only resolvers may have a `team_id` is enforced in the Phase 3 service layer, not the database — DECISIONS.md D18 explains why.
+
+**Core business entity**:
+- `issues` — `owner_id` (FK), `title`, `description`, `status` (business lifecycle enum), `ai_analysis_status` (`PENDING|PROCESSING|COMPLETED|FAILED`, independent of `status` — DECISIONS.md D2), `priority` (nullable until routed), `category_id`/`sub_category_id` (nullable, composite-FK-checked against `sub_categories` exactly like `routing_rules`), `current_team_id`/`current_resolver_id` (nullable, denormalized pointer to the latest `issue_assignments` row), `resolved_at`, `closed_at`.
+
+**Append-only history** (never updated, only inserted):
+- `issue_comments` — `issue_id` (FK, CASCADE), `author_id` (FK), `body`.
+- `issue_status_history` — `issue_id` (FK, CASCADE), `previous_status` (nullable — null only for the creation row), `new_status`, `trigger` (`SYSTEM_CREATE|MANUAL|AUTO_USER_REPLY|AI_ROUTING|ADMIN_OVERRIDE`), `changed_by_id` (nullable FK — automated transitions have no human actor), `note`.
+- `issue_assignments` — `issue_id` (FK, CASCADE), `team_id` (FK), `resolver_id` (nullable FK), `assigned_by_id` (nullable FK — AI-routed assignments have no human actor), `reason`.
+
+**SLA**:
+- `sla_records` — one per issue (`UNIQUE(issue_id)`), `sla_rule_id` (FK), `sla_started_at`, `first_response_deadline_at`, `resolution_deadline_at` (all fixed at creation), `first_response_met_at`/`resolved_met_at` (nullable), `accumulated_pause_seconds` (maintained cache, see below).
+- `sla_pause_intervals` — one row per `WAITING_FOR_USER` window: `sla_record_id` (FK, CASCADE), `paused_at`, `resumed_at` (nullable while open). A `CHECK` constraint forbids `resumed_at < paused_at`; a GiST exclusion constraint (`btree_gist` extension) forbids any two intervals for the same `sla_record` from overlapping — which also means at most one interval can be open at a time, since an open interval's range is treated as extending to infinity. Full reasoning in DECISIONS.md D19. `sla_records.accumulated_pause_seconds` is always re-derivable by summing this table's completed rows; it's a read-optimization cache, not a second source of truth.
+
+**Text relationship map**:
+```
+roles ─┬─< users >─┬─ teams
+       │           │
+categories ─┬─< sub_categories
+            ├─< routing_rules >─ teams
+            │       (+ sub_categories, optional)
+            └─< sla_rules
+
+users ─< issues (owner)
+categories/sub_categories ─< issues (optional, composite-FK checked)
+teams/users ─< issues (current_team / current_resolver, denormalized)
+
+issues ─┬─< issue_comments >─ users (author)
+        ├─< issue_status_history >─ users (changed_by, nullable)
+        ├─< issue_assignments >─ teams, users (resolver / assigned_by)
+        └─1─ sla_records >─ sla_rules
+                  └─< sla_pause_intervals
+```
+
+**Deletion strategy** (DECISIONS.md D15): `RESTRICT` on every FK to a shared reference/config entity (roles, teams, categories, sub_categories, sla_rules, and every FK to `users`) — deactivate via `is_active` instead of deleting. `CASCADE` only for an issue's own owned-child rows (comments, status history, assignments, sla_records → sla_pause_intervals) — if an issue is ever deleted, its own history goes with it since nothing else references those rows.
+
+**Intentionally deferred to later phases** (not built in Phase 2): `ai_analysis_results` (append-only AI suggestion history, referenced in earlier architecture discussion) belongs with AI classification in Phase 7, not the database foundation — Phase 2 only adds the `ai_analysis_status` column D2 requires. No production seed data beyond the three baseline roles (D16); categories/teams/routing/SLA rules are left empty for an admin-facing flow (or an explicitly isolated dev-only script) in a later phase.
+
+**Migrations**: Alembic, two revisions — `initial schema` (all 13 tables, constraints, indexes, the `btree_gist` extension) and `seed baseline roles`. `alembic upgrade head` / `alembic downgrade base` are both verified to run cleanly and repeatably against a real PostgreSQL database (not SQLite, not `create_all()` — the test suite runs actual migrations against a dedicated `resolve_test` database each session).
 
 ## API ENDPOINTS
 - `GET /health` — liveness check, no auth. Returns `{status, environment}`.
@@ -106,20 +147,19 @@ Never `User Issue → AI → blindly trust → persist`.
 **AI output validation is strict, not best-effort.** Pydantic schemas define exactly what a valid suggestion looks like (category/sub_category from the configured set, priority from the allowed enum, non-empty summary/reasoning). Malformed JSON, missing fields, or out-of-vocabulary values are never silently coerced into something plausible — the backend either normalizes through an explicitly supported mapping or marks the analysis `FAILED` and leaves the issue in its current business state for manual triage.
 
 ## IMPORTANT DECISIONS
-See DECISIONS.md for full reasoning. Summary: monolithic FastAPI + React (Option A) with FastAPI `BackgroundTasks` for AI chosen over a Celery/Redis worker split (Option B) and microservices (Option C) for MVP — revisit Option B only if AI load or retry guarantees demand it. AI processing state (`ai_analysis_status`) is kept strictly separate from the issue business lifecycle (`status`). No LangChain/RAG/vector DB/agent framework is used — the `AIProvider` is a plain, understandable abstraction over an OpenAI-compatible API.
+See DECISIONS.md for full reasoning. Summary: monolithic FastAPI + React (Option A) with FastAPI `BackgroundTasks` for AI chosen over a Celery/Redis worker split (Option B) and microservices (Option C) for MVP — revisit Option B only if AI load or retry guarantees demand it. AI processing state (`ai_analysis_status`) is kept strictly separate from the issue business lifecycle (`status`). No LangChain/RAG/vector DB/agent framework is used — the `AIProvider` is a plain, understandable abstraction over an OpenAI-compatible API. Database (Phase 2): UUIDv4 keys everywhere, RESTRICT-vs-CASCADE deletion split, composite FKs for category/sub-category integrity, and a GiST exclusion constraint for SLA pause intervals — see D15–D19.
 
 ## KNOWN BUGS
-None yet — implementation has not started.
+None currently known.
 
 ## CURRENT STATUS
-Phase 1 (project setup) complete. Architecture approved by the developer, including four rounds of clarifications now recorded as D1–D14 in DECISIONS.md (AI/business separation, separate AI-analysis vs. business status, SLA pause/resume, concurrency handling, manual reanalysis, BackgroundTasks limitation).
+Phase 2 (database foundation) complete. Architecture approved by the developer through four rounds of clarification (D1–D14 in DECISIONS.md), then the database layer implemented and verified (D15–D19).
 
-Verified working: backend (FastAPI) boots and serves `GET /health`, with a passing pytest suite; frontend (React + Vite + Tailwind v4) builds and renders, calling the backend health check on load; the full stack (`db` + `backend` + `frontend`) builds and runs together via `docker compose up`, confirmed end-to-end (backend and frontend both reachable, Postgres container healthy). No database models, auth, issue workflow, or AI integration exist yet — that's Phase 2 onward.
+Verified working: 13-table PostgreSQL schema via two Alembic migrations, applied and fully reversed/reapplied cleanly against both a host-side database and a genuinely fresh Docker volume; 40 pytest tests passing, covering every relationship, every unique/foreign-key constraint, the SLA pause-interval exclusion/check constraints, and the deletion-strategy attack review (RESTRICT vs CASCADE), run against a real PostgreSQL database (not SQLite, not `create_all()` — tests run the actual migration files); backend and frontend from Phase 1 still boot and build unaffected; full `docker compose up` still brings up all three services together.
 
 ## PENDING TASKS
-- Phase 2: database schema + Alembic migrations (`users, roles, teams, categories, sub_categories, routing_rules, sla_rules, issues, issue_comments, issue_status_history, issue_assignments, sla_records, sla_pauses, ai_analysis_results`).
-- Phase 3: authentication + RBAC.
-- Phases 4–11: per the roadmap in the initial architecture discussion (issue creation → lifecycle → dashboards → AI classification → SLA/routing → testing/security → duplicate detection → deployment/docs).
+- Phase 3: authentication + RBAC (registration/login, password hashing, JWT, `only resolvers have a team_id` enforcement per D18).
+- Phases 4–11: per the roadmap in the initial architecture discussion (issue creation → lifecycle → dashboards → AI classification (incl. the deferred `ai_analysis_results` table) → SLA/routing → testing/security → duplicate detection → deployment/docs).
 
 ## CONSTRAINTS
 - No SQLite as a Postgres substitute, anywhere.

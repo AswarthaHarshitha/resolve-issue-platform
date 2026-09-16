@@ -193,3 +193,71 @@ Scope rule to avoid AI undoing human decisions: if the issue is still `status=OP
 **Reasoning**: a durable queue with task tracking would close this gap properly, but doing so now repeats the reasoning in D1 — it's infrastructure the MVP's actual scale doesn't need yet, bought at the cost of complexity the learning project doesn't benefit from. A manual recovery button is an honest, sufficient MVP answer as long as it's documented as a known limitation rather than presented as a solved problem.
 
 **Status**: active. Superseded automatically if/when D1 is revisited and a durable worker queue is introduced — at that point tasks would carry real retry semantics and this gap closes structurally instead of manually.
+
+---
+
+## D15 — Primary keys are UUIDv4 everywhere; deletion strategy is RESTRICT for shared reference data, CASCADE for owned history
+
+**Context**: Phase 2 needed one consistent rule for primary keys, and an explicit answer to the attack-review question "what happens when a user/team/category is deleted while other rows still reference it?"
+
+**Decision — primary keys**: every table uses a UUIDv4 primary key, generated application-side (`default=uuid.uuid4`, not a Postgres sequence or `gen_random_uuid()`). One rule for the whole schema is easier to reason about than mixing integer and UUID keys by table "importance," IDs are unpredictable/non-enumerable (a user can't guess `/issues/43` → `/issues/44`), and the ID is known before the row is even inserted, which is convenient when a request needs to reference an ID across more than one statement in the same transaction.
+
+**Decision — deletion strategy**: two different `ON DELETE` behaviors are used deliberately, not inconsistently:
+- **RESTRICT** for shared reference/config entities that other rows point to for their *meaning* — `roles`, `teams`, `categories`, `sub_categories`, `sla_rules`, and every reference from history/business rows back to a `user` (owner, author, changed_by, assigned_by, resolver, current_resolver). The database refuses the delete outright. The supported way to retire one of these is `is_active = false`, not deletion — this is exactly why `teams`, `categories`, and `sub_categories` all carry an `is_active` column. Users are never hard-deleted at all; deactivation is the only supported path, because a user row is referenced by potentially years of audit history that must remain valid.
+- **CASCADE** for true owned-child rows that have no independent meaning without their parent — `issue_comments`, `issue_status_history`, `issue_assignments`, and `sla_records` (which in turn cascades to `sla_pause_intervals`) all cascade from `issues`. If an issue itself is ever deleted (not exposed via any Phase 2 API, but not forbidden at the schema level either), its own history has nothing left to be a history *of*, so it goes with it.
+
+**Reasoning**: a single blanket cascade policy would be wrong in both directions — cascading from `categories` would silently destroy issue history when an admin deactivates a category, and restricting `issue_comments` from their issue would make it impossible to ever clean up an issue's own data. Splitting the two cases by "is this row's meaning independent of its parent" gives a rule that's easy to apply to new tables later, and every attack-review question about deletion in section 12 of the Phase 2 spec is answered by one of these two behaviors rather than an app-level check bolted on afterward.
+
+**Status**: active.
+
+---
+
+## D16 — Roles are required reference data, seeded by a migration, not application code
+
+**Context**: `USER` / `RESOLVER` / `ADMIN` must exist as `roles` rows before a single user can register (Phase 3), in every environment including production — but the project rules also forbid demo/fake data in the production path.
+
+**Decision**: a dedicated Alembic migration (`seed baseline roles`, immediately after the schema migration) inserts exactly these three rows via `op.bulk_insert`, with a matching `downgrade()` that removes them by name. No other table is seeded this way in Phase 2.
+
+**Reasoning**: this is reference data the application cannot function without, not sample/demo content — the distinction the project rules draw is between "data required for the app to work" and "fake business records" (fake users, fake issues), not between "migration" and "no data at all." Categories, sub-categories, teams, routing rules, and SLA rules are genuine admin-configured business decisions with no universally-correct default, so none of them are seeded here — they're deferred to an admin-facing flow (or an explicitly isolated dev-only convenience script) in a later phase, exactly as the project rules require for anything that isn't strictly necessary for the system to boot.
+
+**Status**: active.
+
+---
+
+## D17 — Composite foreign keys enforce category/sub_category integrity at the database level
+
+**Context**: the attack-review question "can an invalid sub-category/category combination be stored?" needed an answer stronger than an application-level check, per the Phase 2 instruction to prefer a database constraint wherever one can safely enforce the invariant.
+
+**Decision**: `sub_categories` carries a `UNIQUE(category_id, id)` constraint (redundant with its own primary key, but required so another table can reference the *pair*). `issues` and `routing_rules` each declare a composite `ForeignKeyConstraint(["category_id", "sub_category_id"], ["sub_categories.category_id", "sub_categories.id"])` alongside their plain `category_id → categories.id` foreign key. Postgres's default `MATCH SIMPLE` semantics mean the composite constraint is automatically satisfied whenever `sub_category_id` is `NULL` (a category with no sub-category chosen yet is fine), but the moment `sub_category_id` is set, it is only valid if it actually belongs to the stated `category_id`.
+
+**Reasoning**: this makes "IT / Plumbing" (a real sub-category, but of Facilities, not IT) impossible to store, full stop — no service-layer code has to remember to check it, and no future bug can skip the check. `routing_rules` gets the identical constraint for the same reason: a routing rule is exactly as vulnerable to this mismatch as an issue is.
+
+**Status**: active.
+
+---
+
+## D18 — User/team pairing (only resolvers have a team) is an application-layer rule, not a database constraint
+
+**Context**: `users.team_id` should conceptually only be set for `RESOLVER`-role users, but a Postgres `CHECK` constraint cannot reference another table's data (it would need to look up `roles.name` for `role_id`), and a trigger would be the only DB-level way to enforce it.
+
+**Decision**: `team_id` is a plain nullable foreign key with no database-level rule tying it to `role_id`. The constraint "only resolvers have a team" will be enforced in the Phase 3 service layer (e.g. on user creation/role change), not the schema.
+
+**Reasoning**: a trigger-based enforcement is possible but is exactly the kind of infrastructure this project's rules ask to avoid adding without a concrete need — the invariant is a business rule about *who should logically have a team*, not a referential-integrity concern that could corrupt other rows if violated (an admin user with a stray `team_id` set is a data-quality issue to catch in the service layer, not a threat to any other table's integrity). This is a deliberate, documented exception to "prefer a database constraint" — made because the constraint would require a trigger, not a plain `CHECK` or `FOREIGN KEY`, crossing the complexity line this project draws.
+
+**Status**: active. Revisit if a data-quality problem in practice suggests the application-layer check isn't being applied consistently.
+
+---
+
+## D19 — `sla_pause_intervals` table, the `accumulated_pause_seconds` cache, and the no-overlap exclusion constraint
+
+**Context**: SLA pause/resume (D11) needs to support multiple, independently-timestamped `WAITING_FOR_USER` windows per issue, be fully reconstructable after a restart, and make "can an issue have two simultaneously open pauses?" and "can two pause windows overlap?" impossible rather than merely checked.
+
+**Decision**: `sla_pause_intervals` is a table beyond the original 12, one row per pause window (`sla_record_id`, `paused_at`, `resumed_at` nullable while open). Two database-level guarantees, not application checks:
+- `CHECK (resumed_at IS NULL OR resumed_at >= paused_at)` — a pause can never be recorded as ending before it started.
+- A PostgreSQL exclusion constraint, `EXCLUDE USING gist (sla_record_id WITH =, tstzrange(paused_at, COALESCE(resumed_at, 'infinity'), '[]') WITH &&)`, requiring the `btree_gist` extension (enabled once, in the initial migration). This single constraint does two jobs at once: it forbids any two intervals for the same SLA record from overlapping, *and*, because an open interval's range is treated as extending to infinity, it automatically forbids a second open interval from being created while one is already open — "at most one active pause at a time" falls out of the same constraint rather than needing a separate rule.
+
+`sla_records.accumulated_pause_seconds` is a maintained cache of `SUM(resumed_at - paused_at)` over this table's *completed* rows for that record — it exists purely so an at-risk/breach check doesn't have to aggregate the pause table on every read. `sla_pause_intervals` remains the source of truth; the cache is always re-derivable from it.
+
+**Reasoning**: this directly answers every SLA-related attack-review question with a schema-level guarantee instead of a promise that application code will always get it right: the full timeline (when did each pause start/end, is one currently open, what's the total) is reconstructable from durable rows alone, survives a server restart, and cannot be corrupted into an inconsistent state by a bug or a race between two concurrent requests — Postgres itself rejects the bad write. This is a small, well-understood use of a single Postgres extension, not event sourcing or new infrastructure, consistent with the Phase 2 instruction to avoid over-engineering the SLA data model while still getting the invariant enforced correctly.
+
+**Status**: active. `ai_analysis_results` (an append-only table to preserve every AI suggestion, including reanalysis attempts, referenced in earlier architecture discussion as D13's persistence layer) is intentionally **not** created in Phase 2 — it belongs with AI classification itself in Phase 7, per the Phase 2 boundary excluding AI/LLM work. Phase 2 only adds the `ai_analysis_status` column on `issues` that D2 requires.

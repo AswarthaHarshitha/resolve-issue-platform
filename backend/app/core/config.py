@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -12,6 +13,9 @@ class Settings(BaseSettings):
     environment: str = "development"
 
     database_url: str
+    # Optional: only used by the test suite. If unset, tests derive it from
+    # database_url by swapping the database name to resolve_test.
+    test_database_url: Optional[str] = None
 
     jwt_secret_key: str
     jwt_algorithm: str = "HS256"

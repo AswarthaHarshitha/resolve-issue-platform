@@ -43,7 +43,8 @@ resolve/
       schemas/          # Pydantic schemas
       services/         # AIProvider, RoutingService, business logic
       repositories/      # data access
-      db/               # session/engine setup, migrations
+      db/               # session/engine setup, base/mixins
+    alembic/            # migrations (source of truth for schema - see below)
     tests/
   frontend/
     src/
@@ -70,6 +71,18 @@ cp frontend/.env.example frontend/.env
 
 See `backend/.env.example` and `frontend/.env.example` for the full list (database connection, JWT secret, CORS origins, AI provider key). Never commit `.env` files — only `.env.example`.
 
+## Database setup
+
+Schema is managed entirely through Alembic migrations — the app never relies on `Base.metadata.create_all()` against a real database (see DECISIONS.md D1's neighbors, D15–D19, for the schema itself). After the database is up and `backend/.env` points at it:
+
+```bash
+cd backend
+source .venv/bin/activate   # or run this inside the backend container
+alembic upgrade head
+```
+
+This creates all 13 tables, their constraints/indexes, and seeds the three baseline roles (`USER`/`RESOLVER`/`ADMIN` — required reference data, not demo content; see DECISIONS.md D16). `alembic downgrade base` fully reverses it. Point `DATABASE_URL` at a fresh database and re-run `alembic upgrade head` any time you need a clean schema.
+
 ## Running locally
 
 ### With Docker (recommended)
@@ -77,7 +90,8 @@ See `backend/.env.example` and `frontend/.env.example` for the full list (databa
 ```bash
 cp backend/.env.example backend/.env
 cp frontend/.env.example frontend/.env
-docker compose up --build
+docker compose up --build -d db backend frontend
+docker compose exec backend alembic upgrade head
 ```
 
 - Backend: http://localhost:8000 (health check at `/health`)
@@ -93,6 +107,7 @@ cd backend
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # edit DATABASE_URL to point at a local Postgres instance
+alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
@@ -113,9 +128,11 @@ source .venv/bin/activate
 pytest
 ```
 
+The test suite needs a reachable PostgreSQL server (the same one `DATABASE_URL` points at, or a separate `TEST_DATABASE_URL`) — it creates a dedicated `resolve_test` database on first run and applies every Alembic migration to it directly, so tests exercise the real migration path rather than a `create_all()` shortcut. It never touches the dev/prod database.
+
 ## Current status
 
-Phase 1 (project setup) is complete: backend and frontend scaffolds boot and talk to each other via a `/health` check. No database models, authentication, issue workflow, or AI integration exist yet — see PROJECT_CONTEXT.md's "Pending tasks" for what's next. Sections below will be filled in as those phases land; this README does not claim functionality that doesn't exist yet.
+Phase 2 (database foundation) is complete: a 13-table PostgreSQL schema (users, roles, teams, categories/sub-categories, routing rules, SLA rules, issues, comments, status history, assignments, SLA records and pause intervals), managed by Alembic migrations and covered by 40 passing pytest tests. See PROJECT_CONTEXT.md's DATABASE section for the full schema and DECISIONS.md D15–D19 for the design reasoning. No authentication, issue API, or AI integration exist yet — see PROJECT_CONTEXT.md's "Pending tasks." Sections below will be filled in further as those phases land; this README does not claim functionality that doesn't exist yet.
 
 ## AI architecture
 
@@ -127,7 +144,8 @@ To be documented as authentication (Phase 3) and the security/testing pass (Phas
 
 ## Limitations
 
-- No application functionality beyond a health check exists yet (Phase 1 of 11).
+- No authentication, issue API, or AI integration exists yet (Phase 2 of 11 complete — database foundation only).
+- The database has no admin-facing way to populate categories/teams/routing/SLA rules yet; those tables are empty until a later phase adds one (or an isolated dev-only seed script).
 - FastAPI `BackgroundTasks` has no persistence — a server crash mid-AI-analysis can leave an issue stuck showing `PROCESSING` until a resolver/admin manually retriggers analysis. See DECISIONS.md D14.
 - Single-tenant design; no multi-organization support.
 - No email/push notifications in MVP — status changes are visible in-app only.
