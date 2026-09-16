@@ -8,7 +8,7 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 
@@ -70,12 +70,18 @@ def test_engine(test_db_url):
 
 @pytest.fixture()
 def db_session(test_engine):
-    """Each test runs inside its own transaction, rolled back afterward, so
-    tests never leak fixture data into one another."""
+    """Each test runs inside its own outer transaction, rolled back
+    afterward, so tests never leak fixture data into one another.
+
+    join_transaction_mode="create_savepoint" means application code that
+    calls session.commit() (e.g. app/services/auth_service.py registering a
+    user, which commits as part of a normal request) only ends a SAVEPOINT
+    nested inside the outer transaction - a new savepoint starts
+    automatically, and the outer transaction (and everything committed
+    inside it) is still fully discarded when this fixture rolls it back."""
     connection = test_engine.connect()
     transaction = connection.begin()
-    SessionLocal = sessionmaker(bind=connection)
-    session: Session = SessionLocal()
+    session: Session = Session(bind=connection, join_transaction_mode="create_savepoint")
 
     try:
         yield session
@@ -87,3 +93,39 @@ def db_session(test_engine):
         if transaction.is_active:
             transaction.rollback()
         connection.close()
+
+
+@pytest.fixture()
+def client(db_session):
+    """A TestClient wired to the same transactional db_session as the test
+    itself, via FastAPI's dependency_overrides - so data a test sets up
+    directly (e.g. a RESOLVER user created for an RBAC test) is visible to
+    the endpoint code, and anything the endpoint writes is visible to the
+    test's assertions, all inside the one transaction db_session rolls back."""
+    from fastapi.testclient import TestClient
+
+    from app.db.session import get_db
+    from app.main import app
+
+    def override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        with TestClient(app) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_auth_rate_limiter():
+    """Every test starts with a clean rate-limit counter - otherwise tests
+    that exercise /auth/login or /auth/register would accumulate hits on the
+    same TestClient-assigned host and could trip 429s for unrelated tests
+    later in the suite."""
+    from app.core.rate_limit import auth_rate_limiter
+
+    auth_rate_limiter.reset()
+    yield
+    auth_rate_limiter.reset()

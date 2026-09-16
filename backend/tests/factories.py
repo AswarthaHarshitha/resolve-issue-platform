@@ -2,8 +2,11 @@
 given session, not yet committed) the minimum valid row and returns it -
 avoids repeating the same boilerplate across every test file."""
 
+from typing import Optional
+
 from sqlalchemy.orm import Session
 
+from app.core.security import hash_password
 from app.models.category import Category
 from app.models.enums import AIAnalysisStatus, IssuePriority, IssueStatus
 from app.models.issue import Issue
@@ -38,6 +41,31 @@ def make_user(session: Session, role: Role, email: str = "user@example.com", tea
         full_name="Test User",
         role_id=role.id,
         team_id=team.id if team else None,
+    )
+    session.add(user)
+    session.flush()
+    return user
+
+
+def make_user_with_role(
+    session: Session,
+    role_name: str,
+    email: str,
+    password: str = "Sup3rSecret!",
+    is_active: bool = True,
+    team: Optional[Team] = None,
+) -> User:
+    """Uses the real seeded USER/RESOLVER/ADMIN role (DECISIONS.md D16),
+    not a TEST_-prefixed placeholder, with a genuine bcrypt hash - for tests
+    that log in as, or assert RBAC against, one of the app's real roles."""
+    role = session.query(Role).filter(Role.name == role_name).one()
+    user = User(
+        email=email,
+        password_hash=hash_password(password),
+        full_name="Test User",
+        role_id=role.id,
+        team_id=team.id if team else None,
+        is_active=is_active,
     )
     session.add(user)
     session.flush()

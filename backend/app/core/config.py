@@ -23,6 +23,12 @@ class Settings(BaseSettings):
 
     cors_allow_origins: str = "http://localhost:5173"
 
+    # In-memory, single-process rate limiting for auth endpoints - see
+    # DECISIONS.md D25 for why this is an intentionally lightweight MVP
+    # limitation rather than a distributed limiter.
+    auth_rate_limit_max_attempts: int = 10
+    auth_rate_limit_window_seconds: int = 60
+
     ai_provider: str = "openai"
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"

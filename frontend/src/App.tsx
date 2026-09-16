@@ -1,38 +1,29 @@
-import { useEffect, useState } from "react";
-import { getHealth } from "./services/api";
+import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
+import { ProtectedRoute } from "./components/ProtectedRoute";
+import { AuthProvider } from "./context/AuthContext";
+import { HomePage } from "./pages/HomePage";
+import { LoginPage } from "./pages/LoginPage";
+import { RegisterPage } from "./pages/RegisterPage";
 
 function App() {
-  const [backendStatus, setBackendStatus] = useState<"checking" | "online" | "offline">(
-    "checking",
-  );
-
-  useEffect(() => {
-    getHealth()
-      .then(() => setBackendStatus("online"))
-      .catch(() => setBackendStatus("offline"));
-  }, []);
-
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background">
-      <div className="rounded-lg border border-border bg-surface p-8 shadow-sm">
-        <h1 className="text-2xl font-semibold text-text-primary">Resolve</h1>
-        <p className="mt-1 text-text-secondary">Intelligent Issue Resolution Platform</p>
-        <p className="mt-4 text-sm">
-          Backend status:{" "}
-          <span
-            className={
-              backendStatus === "online"
-                ? "text-success"
-                : backendStatus === "offline"
-                  ? "text-danger"
-                  : "text-text-secondary"
+    <BrowserRouter>
+      <AuthProvider>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+          <Route path="/register" element={<RegisterPage />} />
+          <Route
+            path="/"
+            element={
+              <ProtectedRoute>
+                <HomePage />
+              </ProtectedRoute>
             }
-          >
-            {backendStatus}
-          </span>
-        </p>
-      </div>
-    </div>
+          />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </AuthProvider>
+    </BrowserRouter>
   );
 }
 

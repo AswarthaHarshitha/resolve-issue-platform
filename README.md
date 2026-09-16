@@ -48,10 +48,11 @@ resolve/
     tests/
   frontend/
     src/
-      components/
-      pages/
+      components/     # ProtectedRoute, etc.
+      context/         # AuthContext (session state)
+      pages/           # LoginPage, RegisterPage, HomePage
       layouts/
-      services/
+      services/        # api.ts (fetch client), authApi.ts, tokenStorage.ts
       hooks/
       types/
       utils/
@@ -130,9 +131,21 @@ pytest
 
 The test suite needs a reachable PostgreSQL server (the same one `DATABASE_URL` points at, or a separate `TEST_DATABASE_URL`) — it creates a dedicated `resolve_test` database on first run and applies every Alembic migration to it directly, so tests exercise the real migration path rather than a `create_all()` shortcut. It never touches the dev/prod database.
 
+## Authentication
+
+`POST /api/v1/auth/register` (always creates a `USER` account — no client-supplied role is ever honored), `POST /api/v1/auth/login` (returns a JWT), `GET /api/v1/auth/me` (requires a valid token), `POST /api/v1/auth/logout` (stateless — see below). Passwords are hashed with bcrypt (DECISIONS.md D26). JWTs carry only `sub`/`iat`/`exp` — never a role claim — and every protected request reloads the current user (role, `is_active`) fresh from PostgreSQL, so a permission change or account deactivation takes effect immediately rather than waiting for a token to expire (DECISIONS.md D21).
+
+**Logout** is a client-side action: the frontend discards its token, but the token itself remains valid (stateless JWTs, no server-side revocation) until it naturally expires — an explicit, documented MVP tradeoff, not a hidden gap (DECISIONS.md D22).
+
+**RBAC**: reusable FastAPI dependencies (`require_role`, `require_any_role` in `app/core/deps.py`) enforce `USER`/`RESOLVER`/`ADMIN` access server-side on every protected endpoint — role checks are exact-match, never hierarchical. The frontend's route guarding is a UX convenience only; it has no bearing on what the backend actually allows.
+
+**Token storage**: the frontend keeps the JWT in `localStorage` and sends it via `Authorization: Bearer`. This is not XSS-resistant — see DECISIONS.md D27 for the full tradeoff and what a hardened production deployment would do instead (httpOnly cookies + CSRF protection).
+
+**Rate limiting**: `/auth/login` and `/auth/register` are protected by a lightweight in-memory, single-process limiter (10 attempts/60s by default) — explicitly not a distributed rate limiter; see DECISIONS.md D25.
+
 ## Current status
 
-Phase 2 (database foundation) is complete: a 13-table PostgreSQL schema (users, roles, teams, categories/sub-categories, routing rules, SLA rules, issues, comments, status history, assignments, SLA records and pause intervals), managed by Alembic migrations and covered by 40 passing pytest tests. See PROJECT_CONTEXT.md's DATABASE section for the full schema and DECISIONS.md D15–D19 for the design reasoning. No authentication, issue API, or AI integration exist yet — see PROJECT_CONTEXT.md's "Pending tasks." Sections below will be filled in further as those phases land; this README does not claim functionality that doesn't exist yet.
+Phase 3 (authentication + RBAC) is complete, on top of the Phase 2 database foundation. 87 passing pytest tests (40 database + 47 auth/RBAC), covering registration, login, JWT validation, `/me`, logout, all USER/RESOLVER/ADMIN authorization combinations, rate limiting, CORS, and error handling — all via real HTTP requests against the running FastAPI app, not mocked. See PROJECT_CONTEXT.md's AUTHENTICATION & RBAC section for the full flow and DECISIONS.md D20–D28 for the design reasoning. No issue API or AI integration exists yet — see PROJECT_CONTEXT.md's "Pending tasks." This README does not claim functionality that doesn't exist yet.
 
 ## AI architecture
 
@@ -140,12 +153,16 @@ Documented in full in DECISIONS.md (D4–D6, D10, D13). Summary: the `AIProvider
 
 ## Security considerations
 
-To be documented as authentication (Phase 3) and the security/testing pass (Phase 9) are implemented. Design commitments already made: passwords are hashed, JWTs are used for auth, every authorization rule is enforced server-side regardless of what the frontend shows, AI output is never trusted without validation, and no secrets are committed to source control.
+Implemented so far (Phase 3): passwords hashed with bcrypt, never stored or returned in plaintext; JWT signature and expiration always verified server-side; role/active-state always read fresh from the database, never trusted from the token; public registration structurally cannot create an elevated-privilege account; login responses don't reveal whether an email is registered; CORS restricted to an explicit origin allow-list; lightweight rate limiting on auth endpoints; unhandled exceptions (including database failures) never leak internals to the client. Full attack-review findings are in the Phase 3 conversation history and DECISIONS.md D20–D28. Still to come: the broader Phase 9 security/failure attack pass once issue/AI/SLA functionality exists to attack.
 
 ## Limitations
 
-- No authentication, issue API, or AI integration exists yet (Phase 2 of 11 complete — database foundation only).
+- No issue API or AI integration exists yet (Phase 3 of 11 complete).
+- No admin-facing way to provision RESOLVER/ADMIN accounts yet — those roles can currently only be assigned by writing directly to the database. A controlled provisioning flow is a later-phase concern (DECISIONS.md D23).
 - The database has no admin-facing way to populate categories/teams/routing/SLA rules yet; those tables are empty until a later phase adds one (or an isolated dev-only seed script).
+- Logout does not invalidate the token server-side (stateless JWT tradeoff, DECISIONS.md D22) — a "logged out" token remains usable until it naturally expires (60 minutes by default).
+- Auth rate limiting is in-memory and single-process — it does not protect a horizontally-scaled, multi-instance deployment (DECISIONS.md D25).
+- Frontend token storage (`localStorage`) is not XSS-resistant (DECISIONS.md D27).
 - FastAPI `BackgroundTasks` has no persistence — a server crash mid-AI-analysis can leave an issue stuck showing `PROCESSING` until a resolver/admin manually retriggers analysis. See DECISIONS.md D14.
 - Single-tenant design; no multi-organization support.
 - No email/push notifications in MVP — status changes are visible in-app only.

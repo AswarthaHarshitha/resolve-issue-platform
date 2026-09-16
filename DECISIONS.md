@@ -261,3 +261,113 @@ Scope rule to avoid AI undoing human decisions: if the issue is still `status=OP
 **Reasoning**: this directly answers every SLA-related attack-review question with a schema-level guarantee instead of a promise that application code will always get it right: the full timeline (when did each pause start/end, is one currently open, what's the total) is reconstructable from durable rows alone, survives a server restart, and cannot be corrupted into an inconsistent state by a bug or a race between two concurrent requests — Postgres itself rejects the bad write. This is a small, well-understood use of a single Postgres extension, not event sourcing or new infrastructure, consistent with the Phase 2 instruction to avoid over-engineering the SLA data model while still getting the invariant enforced correctly.
 
 **Status**: active. `ai_analysis_results` (an append-only table to preserve every AI suggestion, including reanalysis attempts, referenced in earlier architecture discussion as D13's persistence layer) is intentionally **not** created in Phase 2 — it belongs with AI classification itself in Phase 7, per the Phase 2 boundary excluding AI/LLM work. Phase 2 only adds the `ai_analysis_status` column on `issues` that D2 requires.
+
+---
+
+## D20 — Role representation: database is the source of truth, `RoleName` constants are the code-facing handle
+
+**Context**: `roles` is a database table (D16), but application code — RBAC dependencies, the registration service, tests — needs a concrete way to say "the ADMIN role" without scattering the string literal `"ADMIN"` through every file.
+
+**Decision**: `app/core/roles.py` defines a plain class, `RoleName`, with `USER`/`RESOLVER`/`ADMIN` string constants, plus ready-made dependency instances (`require_user`, `require_resolver`, `require_admin`, `require_resolver_or_admin`). Every authorization check, and the registration service's default-role lookup, references these constants — never a bare string. The `roles` table remains what a foreign key actually points at and what a lookup actually queries; the constants are purely a code-side convenience so a typo in a role name becomes a Python `NameError`/import failure instead of a silent authorization bug.
+
+**Reasoning**: this satisfies both halves of the Phase 3 instruction — "the database should remain the source of truth for role identity" and "avoid magic strings scattered across endpoints" — without building a parallel Python enum that could drift from the database rows. If an admin ever adds a fourth role directly in the database, it would have no meaning to existing code until a corresponding constant and RBAC dependency were added deliberately — which is the correct behavior; a new role shouldn't silently gain authorization meaning nobody wrote.
+
+**Status**: active.
+
+---
+
+## D21 — JWT claim design, always reloading the user from the database, and login response ordering
+
+**Context**: three related trust decisions had to be made together: what goes in the token, what the backend trusts from it, and what a login attempt reveals to someone who doesn't yet have valid credentials.
+
+**Decision**:
+- The JWT payload is exactly `{"sub": "<user-uuid>", "iat": ..., "exp": ...}`. No `role`, no `team_id`, nothing else. `get_current_user` decodes and verifies the signature/expiration, then unconditionally re-loads the user from PostgreSQL by `sub` on *every* protected request, and checks `is_active` there — never on anything read out of the token payload.
+- `authenticate_user` checks the email/password pair first; only if that succeeds does it check `is_active`. A wrong password against a disabled account gets the same generic `401 Incorrect email or password` as a wrong password against an active one. Only a caller who has already proven they know the correct password is told the account is specifically disabled.
+
+**Reasoning**: embedding `role` in the token is a common pattern, but it creates exactly the "stale role" problem the Phase 3 spec calls out — an admin who gets demoted, or a resolver removed from a team, would keep their old permissions until the token naturally expired (up to 60 minutes by default) if anything trusted that claim. Reloading fresh from the database on every request means a role change or account deactivation takes effect on the *next* request, not after a token expires, at the cost of one extra indexed primary-key lookup per request — a cost worth paying for a correctness guarantee this important. The login-ordering rule prevents two different information leaks at once: enumerating valid email addresses (wrong password vs. unknown email look identical), and confirming a *guessed* account is disabled without the attacker ever proving they know its password.
+
+**Status**: active.
+
+---
+
+## D22 — Logout: stateless MVP, client-side token discard only
+
+**Context**: JWT access tokens are, by design, self-verifying and stateless — the server doesn't hold a session to destroy. "Logging out" a specific token before its natural expiration requires either a server-side revocation list (a database table or cache checked on every request) or accepting that a token remains valid until it expires regardless of what the client does.
+
+**Decision**: `POST /api/v1/auth/logout` requires a valid token (so it fails cleanly for an already-logged-out or invalid session) and returns `204`, but performs no server-side revocation. The actual logout is the frontend discarding its stored token (`clearStoredToken()` in `AuthContext.logout()`). A test (`test_logout_does_not_invalidate_the_token_stateless_mvp_tradeoff`) asserts the same token still authenticates successfully immediately after calling `/logout` — documenting the real behavior rather than a claimed one.
+
+**Reasoning**: a revocation list is the correct fix but is real infrastructure (a table checked on every single authenticated request, or a cache like Redis) that the Phase 3 spec explicitly says not to introduce without concrete need. The mitigation that *is* in place is a short token lifetime (60 minutes by default, `JWT_ACCESS_TOKEN_EXPIRE_MINUTES`) bounding how long a "logged out" token stays usable if it were somehow replayed. This is an explicit, documented MVP limitation, not a hidden one — see also README's Limitations section.
+
+**Status**: active. If a real need for immediate server-side revocation emerges (e.g. a compromised-account response process), the minimal correct fix is a small `token_denylist` table keyed by JWT `jti` — not Redis — checked in `get_current_user`.
+
+---
+
+## D23 — Public registration cannot create an ADMIN or RESOLVER account
+
+**Context**: the registration endpoint must never let a caller choose their own role.
+
+**Decision**: `RegisterRequest` (the Pydantic schema for `POST /auth/register`) has no `role` field at all. `register_user()` always looks up the `USER` role and assigns it — there is no parameter, branch, or code path anywhere in the registration flow that could assign `RESOLVER` or `ADMIN`. If a client sends `"role": "ADMIN"` in the request body, Pydantic's default `extra="ignore"` behavior silently drops it before the service layer ever sees the payload (verified by `test_public_registration_cannot_create_admin`).
+
+**Reasoning**: "don't trust a role sent by the client" is best enforced by never having a code path capable of accepting one, rather than by remembering to validate/reject it at the API boundary. RESOLVER/ADMIN account provisioning is deliberately out of scope for Phase 3 (no admin-facing user-management endpoint exists yet) — the only way such an account exists today is created directly in the database (exactly how this phase's manual RBAC verification was done). A controlled provisioning flow (e.g. an admin-only "create resolver" endpoint) is a future-phase concern once admin functionality exists.
+
+**Status**: active.
+
+---
+
+## D24 — RBAC scope: role-level now, resource-level deferred; temporary `/_rbac-demo` endpoints
+
+**Context**: Phase 3 has to prove role-based access control actually works over real HTTP, but the only resources that will eventually need *resource-level* authorization (e.g. "a USER may only view their own issues," "a RESOLVER may only act on issues assigned to their team") don't exist yet — issue endpoints are a later phase.
+
+**Decision**: `app/core/deps.py` implements `get_current_user`, `require_role`, and `require_any_role` as general-purpose, reusable dependencies with no knowledge of any specific resource. `app/api/routes/rbac_demo.py` adds four throwaway endpoints (`/_rbac-demo/user-only`, `/resolver-only`, `/admin-only`, `/resolver-or-admin`) whose only purpose is giving the test suite (and this phase's manual verification) something real to send authenticated HTTP requests against. They are explicitly documented as temporary in their own module docstring and are expected to be deleted once Phase 4+ introduces real protected endpoints.
+
+**Reasoning**: the Phase 3 spec is explicit that resource-level checks (issue ownership, team membership) must wait until there's an actual resource to check — building that logic now against nothing would be speculative and likely wrong once real requirements (e.g. exact issue-visibility rules) show up. The demo endpoints keep the RBAC dependency chain genuinely tested over HTTP (not just unit-tested by calling a dependency function directly) without pretending they're real product functionality.
+
+**Status**: active, temporary by design. Remove `rbac_demo.py` when Phase 4's issue endpoints can take over as the real target for these tests.
+
+---
+
+## D25 — Rate limiting: in-memory, single-process, documented as a known limitation
+
+**Context**: `/auth/login` and `/auth/register` need *some* protection against repeated automated attempts, but the project rules explicitly forbid adding Redis or similar infrastructure just for this.
+
+**Decision**: `app/core/rate_limit.py` implements a small fixed-window limiter entirely in process memory (a dict of timestamps per client IP, guarded by a lock), applied as a FastAPI dependency on both endpoints. Limits are configurable via `AUTH_RATE_LIMIT_MAX_ATTEMPTS`/`AUTH_RATE_LIMIT_WINDOW_SECONDS` (defaults: 10 attempts per 60 seconds). Exceeding the limit returns `429`.
+
+**Reasoning**: this is real protection for the single-process deployment this project actually runs (`uvicorn app.main:app`, one process, per `docker-compose.yml`), and it is honestly documented as exactly that — not claimed as anything more. It has two known gaps, stated plainly rather than glossed over: it resets on every process restart, and it is **not** shared across multiple worker processes or horizontally-scaled instances (`uvicorn --workers N` or multiple containers would each have their own independent counters, diluting the effective limit by a factor of N). A production deployment that actually scales horizontally would need a shared store (Redis, or a database-backed counter) — deliberately not built now, per the "no unnecessary infrastructure" rule, since this project runs as a single process today.
+
+**Status**: active. Revisit if/when the deployment model changes to multiple worker processes or instances.
+
+---
+
+## D26 — Password hashing: bcrypt via passlib
+
+**Context**: passwords must never be stored in a reversible or fast-to-brute-force form.
+
+**Decision**: `passlib.context.CryptContext(schemes=["bcrypt"])`. `bcrypt` is pinned to `4.0.1` in `requirements.txt` alongside `passlib==1.7.4` — passlib 1.7.4's bcrypt backend-detection code is incompatible with `bcrypt>=4.1` (a well-known upstream issue), so the version is pinned explicitly rather than left to float and break on a future `pip install`.
+
+**Reasoning**: bcrypt is a purpose-built, adaptive password hash (configurable work factor, built-in per-password salt) as opposed to a general-purpose fast hash like SHA-256, which would make brute-forcing leaked hashes far cheaper. `passlib` is a thin, well-tested wrapper rather than hand-rolling salt/work-factor handling. This is a standard, unsurprising choice — no bespoke or exotic hashing scheme.
+
+**Status**: active.
+
+---
+
+## D27 — Frontend token storage: `localStorage` + `Authorization` header, with the XSS tradeoff documented rather than ignored
+
+**Context**: the SPA needs to hold onto the JWT access token between page loads and attach it to every API request. Two realistic options existed: `localStorage` (read by JavaScript, sent manually via an `Authorization` header) or an `httpOnly` cookie (invisible to JavaScript, sent automatically by the browser, but requiring CSRF protection and backend cookie-issuing/CORS-credentials configuration).
+
+**Decision**: the token is stored in `localStorage` (`frontend/src/services/tokenStorage.ts`) and attached manually via `Authorization: Bearer <token>` on every request (`frontend/src/services/api.ts`).
+
+**Reasoning**: this keeps the backend fully stateless with no cookie infrastructure, no CSRF token plumbing, and works identically for a browser client or any other HTTP client — appropriate for an MVP with no existing session/cookie infrastructure to build on, and consistent with "no unnecessary infrastructure." The honest tradeoff: this is **not** XSS-resistant — a successful script injection on the frontend's origin could read `localStorage` and exfiltrate the token, usable for up to `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` (60 minutes by default). A hardened production deployment would move the token into an `httpOnly`, `Secure`, `SameSite=strict` cookie set by the backend at login, paired with CSRF protection (e.g. a double-submit cookie) — a real architectural change to the login/session flow, not a small tweak, which is why it's deferred rather than half-implemented now.
+
+**Status**: active. Revisit before any production deployment that handles real user data at scale.
+
+---
+
+## D28 — CORS: explicit origin allow-list, never a wildcard
+
+**Context**: the React frontend and FastAPI backend run on different origins (`localhost:5173` vs `localhost:8000` in dev), so the browser enforces CORS on every request unless the backend explicitly allows it.
+
+**Decision**: `CORSMiddleware` (configured in Phase 1, reaffirmed here) reads `allow_origins` from `settings.cors_origins_list`, itself parsed from the `CORS_ALLOW_ORIGINS` environment variable (comma-separated) — never a hardcoded `["*"]`. `.env.example` ships with `http://localhost:5173` for local development; a production deployment sets this to the real frontend domain(s). Verified by `tests/test_cors.py`, which asserts the configured origin gets reflected in `Access-Control-Allow-Origin` and an arbitrary unlisted origin does not.
+
+**Reasoning**: a wildcard origin combined with `allow_credentials=True` (needed for the `Authorization` header to be sent cross-origin in some configurations) is specifically what browsers refuse and what CORS misconfiguration checklists flag first — keeping this environment-driven means development stays convenient (one default origin) while production is forced to be explicit about exactly which frontend domain(s) may call the API.
+
+**Status**: active.
