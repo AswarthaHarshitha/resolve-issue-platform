@@ -10,7 +10,7 @@ from app.models.enums import AIAnalysisResultStatus, AIAnalysisStatus, IssuePrio
 from app.services.ai_analysis_service import run_ai_analysis
 from app.services.ai_provider import AISuggestion
 from tests.auth_helpers import auth_headers
-from tests.factories import make_category, make_issue, make_user_with_role
+from tests.factories import make_category, make_issue, make_team, make_user_with_role
 from tests.fake_ai_provider import FakeAIProvider
 
 
@@ -20,6 +20,50 @@ def _create_via_api(client, user):
     )
     assert response.status_code == 201
     return response.json()
+
+
+def test_resolver_cannot_trigger_reanalysis_on_a_different_teams_issue(client, db_session):
+    """Phase 9 regression: request_reanalysis previously checked only the
+    caller's role (RESOLVER/ADMIN), not can_access_issue - a resolver could
+    trigger reanalysis on an issue routed to a different team, unlike every
+    other issue-mutating action (view/comment/transition/assign), which is
+    team-scoped (DECISIONS.md D41)."""
+    owner = make_user_with_role(db_session, "USER", "reanalyze-idor-owner@example.com")
+    admin = make_user_with_role(db_session, "ADMIN", "reanalyze-idor-admin@example.com")
+    team_a = make_team(db_session, "Reanalyze Team A")
+    team_b = make_team(db_session, "Reanalyze Team B")
+    resolver_b = make_user_with_role(db_session, "RESOLVER", "reanalyze-idor-resolver-b@example.com", team=team_b)
+
+    issue = _create_via_api(client, owner)
+    assign_response = client.patch(
+        f"/api/v1/issues/{issue['id']}/assignment",
+        json={"team_id": str(team_a.id)},
+        headers=auth_headers(admin),
+    )
+    assert assign_response.status_code == 200
+
+    response = client.post(f"/api/v1/issues/{issue['id']}/reanalyze", headers=auth_headers(resolver_b))
+
+    assert response.status_code == 403
+
+
+def test_resolver_can_trigger_reanalysis_on_their_own_teams_issue(client, db_session):
+    owner = make_user_with_role(db_session, "USER", "reanalyze-idor-owner2@example.com")
+    admin = make_user_with_role(db_session, "ADMIN", "reanalyze-idor-admin2@example.com")
+    team_a = make_team(db_session, "Reanalyze Team A2")
+    resolver_a = make_user_with_role(db_session, "RESOLVER", "reanalyze-idor-resolver-a@example.com", team=team_a)
+
+    issue = _create_via_api(client, owner)
+    assign_response = client.patch(
+        f"/api/v1/issues/{issue['id']}/assignment",
+        json={"team_id": str(team_a.id)},
+        headers=auth_headers(admin),
+    )
+    assert assign_response.status_code == 200
+
+    response = client.post(f"/api/v1/issues/{issue['id']}/reanalyze", headers=auth_headers(resolver_a))
+
+    assert response.status_code == 202
 
 
 def test_user_cannot_trigger_reanalysis(client, db_session):

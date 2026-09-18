@@ -152,6 +152,45 @@ def test_sla_rule_rejects_resolution_shorter_than_first_response(client, db_sess
     assert response.status_code == 400
 
 
+def test_sla_rule_update_rejects_non_positive_minutes(client, db_session):
+    """Phase 9 regression: SLARuleUpdateRequest was missing the same
+    positive-minutes validator SLARuleCreateRequest already had, so an
+    admin PATCH could set first_response_minutes/resolution_minutes to 0
+    or a negative number - an impossible SLA value that would leave the
+    deadline already in the past the instant the rule was applied."""
+    admin = make_user_with_role(db_session, "ADMIN", "admin-sla3@example.com")
+    category = make_category(db_session, "Ops3")
+
+    create_response = client.post(
+        "/api/v1/admin/sla-rules",
+        json={
+            "category_id": str(category.id),
+            "priority": "HIGH",
+            "first_response_minutes": 60,
+            "resolution_minutes": 1440,
+        },
+        headers=auth_headers(admin),
+    )
+    assert create_response.status_code == 201
+    rule_id = create_response.json()["id"]
+
+    response = client.patch(
+        f"/api/v1/admin/sla-rules/{rule_id}",
+        json={"first_response_minutes": 0},
+        headers=auth_headers(admin),
+    )
+
+    assert response.status_code == 422
+
+    negative_response = client.patch(
+        f"/api/v1/admin/sla-rules/{rule_id}",
+        json={"resolution_minutes": -10},
+        headers=auth_headers(admin),
+    )
+
+    assert negative_response.status_code == 422
+
+
 def test_admin_can_promote_a_user_to_resolver_with_a_team(client, db_session):
     admin = make_user_with_role(db_session, "ADMIN", "admin-promote1@example.com")
     user = make_user_with_role(db_session, "USER", "admin-promote-target1@example.com")

@@ -2,7 +2,10 @@
 (DECISIONS.md D7), admin reassignment vs. resolver self-assign
 (DECISIONS.md D41)."""
 
+import threading
 import uuid
+
+from sqlalchemy.orm import Session
 
 from app.models.issue_assignment import IssueAssignment
 from tests.auth_helpers import auth_headers
@@ -183,3 +186,115 @@ def test_cannot_assign_resolver_without_a_team_first(client, db_session):
     )
 
     assert response.status_code == 400
+
+
+def test_two_resolvers_racing_to_self_assign_never_corrupt_state(test_engine):
+    """Phase 9 concurrency attack: two resolvers on the same team both send
+    a self-assign request for the same unresolved issue at nearly the same
+    instant. update_assignment does not require the issue to be currently
+    unassigned before a same-team resolver self-assigns (there is no
+    documented "first come, first served" exclusivity rule - only "must be
+    your own team's issue"), so this does not assert one specific winner.
+    It asserts the actual safety invariant: the row lock
+    (get_issue_by_id_for_update) serializes the two requests rather than
+    interleaving them, both individually-valid requests succeed, the final
+    current_resolver_id is unambiguously one of the two (never null, never
+    corrupted), and the append-only issue_assignments history has exactly
+    one row per request - never fewer (a lost write) and never duplicated."""
+    from app.models.issue import Issue
+    from app.models.role import Role
+    from app.models.team import Team
+    from app.models.user import User as UserModel
+    from app.services import assignment_service, issue_service
+
+    setup_engine = test_engine
+    with Session(bind=setup_engine) as setup_session:
+        user_role = setup_session.query(Role).filter_by(name="USER").one()
+        resolver_role = setup_session.query(Role).filter_by(name="RESOLVER").one()
+
+        team = Team(name="Race Team")
+        setup_session.add(team)
+        setup_session.flush()
+
+        owner = UserModel(
+            email="assign-race-owner@example.com", password_hash="x", full_name="Owner", role_id=user_role.id
+        )
+        resolver_a = UserModel(
+            email="assign-race-resolver-a@example.com",
+            password_hash="x",
+            full_name="Resolver A",
+            role_id=resolver_role.id,
+            team_id=team.id,
+        )
+        resolver_b = UserModel(
+            email="assign-race-resolver-b@example.com",
+            password_hash="x",
+            full_name="Resolver B",
+            role_id=resolver_role.id,
+            team_id=team.id,
+        )
+        setup_session.add_all([owner, resolver_a, resolver_b])
+        setup_session.flush()
+
+        issue = issue_service.create_issue(setup_session, owner=owner, title="Race to self-assign", description="...")
+        issue.current_team_id = team.id
+        setup_session.commit()
+        issue_id = issue.id
+        team_id = team.id
+        resolver_a_id = resolver_a.id
+        resolver_b_id = resolver_b.id
+        owner_id = owner.id
+
+    try:
+        results = {}
+        barrier = threading.Barrier(2)
+
+        def race(name, resolver_id):
+            with Session(bind=setup_engine) as session:
+                resolver = session.get(UserModel, resolver_id)
+                barrier.wait()
+                try:
+                    assignment_service.update_assignment(
+                        session,
+                        issue_id=issue_id,
+                        current_user=resolver,
+                        team_id=None,
+                        resolver_id=None,
+                        reason=None,
+                    )
+                    results[name] = "succeeded"
+                except Exception as exc:  # pragma: no cover - would indicate a genuine defect
+                    results[name] = f"unexpected: {exc!r}"
+
+        thread_a = threading.Thread(target=race, args=("a", resolver_a_id))
+        thread_b = threading.Thread(target=race, args=("b", resolver_b_id))
+        thread_a.start()
+        thread_b.start()
+        thread_a.join(timeout=10)
+        thread_b.join(timeout=10)
+
+        assert results["a"] == "succeeded"
+        assert results["b"] == "succeeded"
+
+        with Session(bind=setup_engine) as verify_session:
+            final_issue = verify_session.get(Issue, issue_id)
+            assert final_issue.current_resolver_id in (resolver_a_id, resolver_b_id)
+            assert final_issue.current_team_id == team_id
+
+            history = (
+                verify_session.query(IssueAssignment)
+                .filter(IssueAssignment.issue_id == issue_id)
+                .order_by(IssueAssignment.created_at)
+                .all()
+            )
+            assert len(history) == 2
+            assert {row.resolver_id for row in history} == {resolver_a_id, resolver_b_id}
+    finally:
+        with Session(bind=setup_engine) as cleanup_session:
+            cleanup_session.query(IssueAssignment).filter(IssueAssignment.issue_id == issue_id).delete()
+            cleanup_session.query(Issue).filter(Issue.id == issue_id).delete()
+            cleanup_session.query(UserModel).filter(
+                UserModel.id.in_([resolver_a_id, resolver_b_id, owner_id])
+            ).delete(synchronize_session=False)
+            cleanup_session.query(Team).filter(Team.id == team_id).delete()
+            cleanup_session.commit()

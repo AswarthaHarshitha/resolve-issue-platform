@@ -14,6 +14,7 @@ from typing import Callable, Optional
 from uuid import UUID
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import ObjectDeletedError
 
 from app.core.roles import RoleName
 from app.db.session import SessionLocal
@@ -107,6 +108,27 @@ def run_ai_analysis(
             _record_failure(db, issue, attempt_number, raw=raw_suggestion, error_message=str(exc))
             return
 
+        # Phase 9 fix: the AI provider call above can take several real
+        # seconds, and `issue` was loaded via a plain, unlocked db.get() at
+        # the top of this function - by now it may be stale. Force a real
+        # SELECT ... FOR UPDATE re-read (the same row lock every other issue
+        # mutator uses) right before the one call that actually writes
+        # business state (route_issue mutates status/category/priority/
+        # team). A plain re-SELECT is not enough here: `issue` is already in
+        # this session's identity map from the earlier db.get(), and
+        # SQLAlchemy does not repopulate an already-loaded object's
+        # attributes from a later query by default - db.refresh() is what
+        # actually forces that. Without this, a concurrent manual transition
+        # that validly completed *during* the AI call would be silently
+        # overwritten by this function's blind write of its now-outdated
+        # in-memory snapshot - route_issue's own "only route an OPEN issue"
+        # guard is only a real guarantee if it's checked against fresh,
+        # locked data, not a value read before the wait.
+        try:
+            db.refresh(issue, with_for_update=True)
+        except ObjectDeletedError:
+            return  # Issue was deleted while the AI call was in flight.
+
         route_issue(db, issue=issue, validated=validated)
 
         db.add(
@@ -173,13 +195,22 @@ def request_reanalysis(
     """Validates the reanalyze request (DECISIONS.md D13) and flips the
     issue to PENDING so a caller (the API route) can schedule
     run_ai_analysis as a background task. Does not run the analysis itself
-    - that always happens out-of-request, same as issue creation."""
+    - that always happens out-of-request, same as issue creation.
+
+    Access is role-gated (RESOLVER/ADMIN only) AND team-scoped via the same
+    can_access_issue used by every other issue action (Phase 9 fix: a
+    resolver could previously trigger reanalysis on another team's issue,
+    since this was the one issue-mutating path that checked role but not
+    can_access_issue)."""
     if current_user.role.name not in (RoleName.RESOLVER, RoleName.ADMIN):
         raise ReanalyzeAccessDeniedError()
 
     issue = issue_repository.get_issue_by_id_for_update(db, issue_id)
     if issue is None:
         raise IssueNotFoundError()
+
+    if not can_access_issue(issue, current_user):
+        raise ReanalyzeAccessDeniedError()
 
     if issue.ai_analysis_status == AIAnalysisStatus.PROCESSING:
         raise ReanalyzeInProgressError()

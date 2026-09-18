@@ -2,11 +2,26 @@ from typing import List, Optional, Tuple
 from uuid import UUID
 
 from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models.enums import IssueStatus
 from app.models.issue import Issue
 from app.models.issue_status_history import IssueStatusHistory
+from app.models.sla_record import SLARecord
+
+# build_issue_public touches every one of these relationships (directly, or
+# via compute_sla_status's sla_record.pause_intervals) for every issue it
+# serializes. Without eager loading, GET /issues would issue one extra
+# lazy-load query per relationship per issue - up to ~600 extra round trips
+# for a single max-page-size (100) request (Phase 9 performance finding).
+_ISSUE_LIST_EAGER_OPTIONS = (
+    selectinload(Issue.owner),
+    selectinload(Issue.category),
+    selectinload(Issue.sub_category),
+    selectinload(Issue.current_team),
+    selectinload(Issue.current_resolver),
+    selectinload(Issue.sla_record).selectinload(SLARecord.pause_intervals),
+)
 
 
 def create_issue(db: Session, *, owner_id: UUID, title: str, description: str) -> Issue:
@@ -58,7 +73,7 @@ def list_issues(
         count_stmt = count_stmt.where(condition)
     total = db.execute(count_stmt).scalar_one()
 
-    stmt = select(Issue)
+    stmt = select(Issue).options(*_ISSUE_LIST_EAGER_OPTIONS)
     for condition in filters:
         stmt = stmt.where(condition)
     stmt = stmt.order_by(Issue.created_at.desc()).offset((page - 1) * page_size).limit(page_size)

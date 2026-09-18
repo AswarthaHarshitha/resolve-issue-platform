@@ -113,6 +113,32 @@ def test_invalid_authorization_scheme_fails(client, db_session):
     assert response.status_code == 401
 
 
+def test_alg_none_token_is_rejected(client, db_session):
+    """Phase 9 attack: the classic "alg=none" JWT forgery, where an attacker
+    crafts a token with no signature at all and hopes a lenient decoder
+    accepts it. decode_access_token passes algorithms=[settings.jwt_algorithm]
+    explicitly to jose.jwt.decode, which refuses to honor a token whose
+    header claims an algorithm outside that allow-list - this proves it
+    rather than just asserting the implementation detail."""
+    import base64
+    import json
+
+    user = make_user_with_role(db_session, "USER", "algnone@example.com")
+
+    def b64url(data: bytes) -> bytes:
+        return base64.urlsafe_b64encode(data).rstrip(b"=")
+
+    now = datetime.now(timezone.utc)
+    payload = {"sub": str(user.id), "iat": int(now.timestamp()), "exp": now + timedelta(minutes=60)}
+    header_b64 = b64url(json.dumps({"alg": "none", "typ": "JWT"}).encode())
+    payload_b64 = b64url(json.dumps(payload, default=str).encode())
+    forged_token = f"{header_b64.decode()}.{payload_b64.decode()}."
+
+    response = client.get("/api/v1/auth/me", headers=_auth_header(forged_token))
+
+    assert response.status_code == 401
+
+
 def test_tampered_role_claim_inside_a_validly_signed_token_is_ignored(client, db_session):
     """Even if a token somehow carries a role claim (our own tokens never do
     - DECISIONS.md D21), the backend never reads it: role always comes from

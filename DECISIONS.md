@@ -564,3 +564,63 @@ Scope rule to avoid AI undoing human decisions: if the issue is still `status=OP
 **Reasoning**: computing "at risk" by iterating open issues with an SLA record in Python (rather than a single SQL aggregate) is a deliberate, documented tradeoff - the underlying computation (D40's pause-aware effective-elapsed math) isn't expressible as a plain column comparison, and at this project's real scale (a portfolio-sized deployment, not enterprise issue volume) the cost is negligible. It's flagged in the code as a scale consideration precisely so it isn't mistaken for something that would stay cheap at very large issue counts.
 
 **Status**: active.
+
+---
+
+## D44 — Phase 9 fix: AI routing task was missing the row lock every other mutator uses, allowing it to silently overwrite a concurrent manual transition
+
+**Context**: Phase 9's concurrency attack pass deliberately raced `run_ai_analysis` (the `BackgroundTask` that calls the AI provider and then routes the issue) against a manual status transition on the same issue, both live against a real running server and deterministically via a controlled thread reproduction. The race was real: `run_ai_analysis` loads its `Issue` via a plain `db.get()` at the top of the function, then spends several real seconds calling the AI provider before writing anything. If a resolver validly transitioned the issue (e.g. `OPEN → TRIAGED`) *while* that call was in flight, the AI task's eventual write - based on its now-stale in-memory snapshot - silently overwrote the resolver's already-committed, already-200-OK'd change, as if it had never happened. `route_issue`'s own "only route an issue that's still OPEN" guard was real code but checked against stale data, so it never actually caught this.
+
+**Decision**: `run_ai_analysis` now calls `db.refresh(issue, with_for_update=True)` immediately before `route_issue`, forcing a real `SELECT ... FOR UPDATE` re-read at the last possible moment - the same row lock `issue_repository.get_issue_by_id_for_update` gives every other mutator (D12). A plain re-`SELECT` was tried first and did **not** fix it: `issue` was already in that session's identity map from the earlier `db.get()`, and SQLAlchemy does not repopulate an already-loaded object's attributes from a later query by default - only an explicit `refresh()` (or `populate_existing()`) does. The lock is deliberately acquired only for this final, fast, local write - never for the multi-second external AI provider call itself, which would block every other operation on that issue for the duration of a network round-trip and contradict the whole "AI is advisor, never blocks the workflow" principle (D1, D3).
+
+**Reasoning**: this is exactly the failure mode the row-locking architecture exists to prevent (D12), just in a code path that had grown outside that pattern because it's triggered by a background task rather than a request handler. The fix is minimal and reuses the existing mechanism rather than inventing a new one. Reproduced and verified via a deterministic real-thread test (`tests/test_ai_routing_concurrency.py`) that forces the exact interleaving (AI task blocked mid-provider-call, manual transition completes, AI task released) - before the fix, the manual transition's committed `TRIAGED` state was silently reverted to `ASSIGNED` by the AI task; after the fix, `route_issue`'s guard correctly detects the issue is no longer `OPEN` and defers to the human's action, exactly as its docstring always claimed.
+
+**Status**: active.
+
+---
+
+## D45 — Phase 9 fix: manual AI reanalysis was missing team-scoped authorization
+
+**Context**: every issue-mutating action a `RESOLVER` can take (view, comment, transition, assign) is scoped by `issue_service.can_access_issue` (D41) - a resolver cannot touch another team's issue. `POST /issues/{id}/reanalyze` was the one exception: `ai_analysis_service.request_reanalysis` checked only that the caller's *role* was `RESOLVER` or `ADMIN`, never that the specific issue was actually theirs to act on. A resolver on Team B could trigger reanalysis on a Team A issue.
+
+**Decision**: `request_reanalysis` now calls `can_access_issue(issue, current_user)` immediately after the row-locked load, exactly like every other mutator, raising the same `ReanalyzeAccessDeniedError` (403) a role mismatch already produced.
+
+**Reasoning**: found during the Phase 9 authorization sweep by reading `request_reanalysis` against the pattern every other mutator follows, then confirmed live: a Team B resolver's reanalyze request against a Team A issue was accepted (202) before the fix and correctly rejected (403) after. Regression tests added in `tests/test_ai_reanalyze.py`.
+
+**Status**: active.
+
+---
+
+## D46 — Phase 9 fix: SLA status kept evaluating against the live clock after an issue was resolved
+
+**Context**: `compute_sla_status` is a pure function of persisted rows plus a `now` parameter (D40) - correct in isolation. The bug was at the one call site that matters for a resolved issue: `build_issue_public` always called it with `now=None` (defaulting to the real current time), regardless of whether the issue had already been resolved. An issue resolved comfortably within its SLA, then left sitting `RESOLVED` for hours or days awaiting the owner's confirmation, would eventually render as `resolution_breached: true` on its detail page purely because more real time had passed - never because anything about how it was actually handled changed.
+
+**Decision**: `build_issue_public` now calls `compute_sla_status(issue.sla_record, now=issue.resolved_at)`. `resolved_at` is `None` for every issue that hasn't reached `RESOLVED`/`CLOSED` (set exactly once, in `transition_status`, and cleared by `reject_resolution`), so this is a no-op for every still-open issue - `compute_sla_status` falls back to the real current time exactly as before. For a resolved issue, the SLA clock is now frozen at the moment it was actually resolved, matching what "was this resolved on time" should mean.
+
+**Reasoning**: caught while reading the SLA engine against Phase 9's "already breached SLA... issue reaches RESOLVED... reaches CLOSED" attack scenarios - `first_response_met_at`/`resolved_met_at` exist as columns but are never written anywhere in the codebase, so nothing was suppressing the live-clock computation once an issue stopped actively progressing. Verified with `tests/test_sla_freeze_on_resolution.py`: an issue resolved 3 minutes into a 10-minute SLA, checked against a `now` an hour later, correctly still shows not-breached (frozen at the 3-minute mark); one resolved late (15 minutes into the same 10-minute SLA) correctly still shows breached, also frozen rather than continuing to accumulate.
+
+**Status**: active.
+
+---
+
+## D47 — Phase 9 fix: SLA rule updates were missing the positive-minutes validation rule creation already had
+
+**Context**: `SLARuleCreateRequest` validates `first_response_minutes`/`resolution_minutes` are positive integers; `SLARuleUpdateRequest` (the `PATCH` counterpart) did not, so an admin could set either to `0` or negative via update even though creation always prevented it - an "impossible SLA value" whose deadline would already be in the past the instant the rule was saved.
+
+**Decision**: added the identical `field_validator` to `SLARuleUpdateRequest`.
+
+**Reasoning**: an input-validation asymmetry found during the Phase 9 input-attack sweep (`admin_service.create_sla_rule` vs. `update_sla_rule` side by side). Admin-only surface, so severity is low, but it's a real gap between what create and update each allow for the same field. Regression test in `tests/test_admin.py`.
+
+**Status**: active.
+
+---
+
+## D48 — Phase 9 performance fix: eager-load issue relationships on the list endpoint
+
+**Context**: `Issue`'s relationships (`owner`, `category`, `sub_category`, `current_team`, `current_resolver`, `sla_record`, and `sla_record.pause_intervals`) all default to lazy loading. `build_issue_public` touches every one of them for every issue it serializes (directly, or through `compute_sla_status`), and `GET /issues` returns up to `page_size` (max 100) issues per call - an obvious N+1 pattern, bounded but real: up to roughly six extra round trips per issue on a single list request.
+
+**Decision**: `issue_repository.list_issues`'s query now carries `selectinload` options for all of the above (a `selectinload` for `sla_record.pause_intervals` nested under the `sla_record` one). `get_issue_by_id`/`get_issue_by_id_for_update` (single-issue reads) were left as-is - the N+1 pattern only compounds where multiple issues are returned in one response.
+
+**Reasoning**: found during the Phase 9 performance sanity pass ("obvious N+1 queries... unbounded list endpoints"). Verified with a query-counting regression test (`tests/test_issue_list_query_count.py`, using a `before_cursor_execute` listener on the real test connection) that asserts a small, fixed query count for a page of 8 issues each with distinct owner/category/team/resolver - confirmed to fail without the fix (by temporarily reverting it) and pass with it.
+
+**Status**: active.

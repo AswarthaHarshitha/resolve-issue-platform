@@ -114,7 +114,15 @@ def build_issue_public(issue: "Issue") -> IssuePublic:
 
     public = IssuePublic.model_validate(issue)
     if issue.sla_record is not None:
-        status = compute_sla_status(issue.sla_record)
+        # Once an issue is RESOLVED (or CLOSED), freeze the SLA clock at the
+        # moment it was resolved rather than letting effective_elapsed_seconds
+        # keep growing against the live wall clock while it sits waiting for
+        # the owner's confirmation (Phase 9 fix: previously an issue resolved
+        # well within its SLA would eventually render as "breached" purely
+        # because more real time passed after resolution). resolved_at is
+        # None for every still-open issue, so this is a no-op for them -
+        # compute_sla_status falls back to the real current time.
+        status = compute_sla_status(issue.sla_record, now=issue.resolved_at)
         public.sla = SLAStatusPublic(
             first_response_deadline_at=status.first_response_deadline_at,
             resolution_deadline_at=status.resolution_deadline_at,

@@ -132,6 +132,13 @@ class SLARuleUpdateRequest(BaseModel):
     resolution_minutes: Optional[int] = None
     is_active: Optional[bool] = None
 
+    @field_validator("first_response_minutes", "resolution_minutes")
+    @classmethod
+    def validate_positive(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and value <= 0:
+            raise ValueError("must be a positive number of minutes")
+        return value
+
 
 class SLARuleAdminPublic(BaseModel):
     model_config = ConfigDict(from_attributes=True)
