@@ -648,3 +648,15 @@ Scope rule to avoid AI undoing human decisions: if the issue is still `status=OP
 **Reasoning**: satisfies "one underlying authentication service, three frontend entry points" exactly - nothing about JWT issuance, password verification, or per-request RBAC changed at all; every API call after login is still independently authorized by the pre-existing `require_role`/`can_access_issue` checks regardless of which entry point was used to sign in. The context check only gates *which door* a given account may complete a login through - it is not, and was never meant to be, a replacement for the real authorization system. Verified live against the running backend: all 3 matching role/context pairs succeed (200), all 6 mismatched pairs are rejected (401) with a response body identical to a wrong-password attempt.
 
 **Status**: active.
+
+---
+
+## D51 — Local development password reset script
+
+**Context**: local test/demo accounts (including ones created directly through the UI by whoever is developing, not by any script) inevitably end up with a password nobody currently at the keyboard actually knows. There was no way to recover access to such an account short of a raw, unscripted database write.
+
+**Decision**: `backend/scripts/reset_dev_password.py`, following the identical isolation pattern as `seed_dev_reference_data.py`/`bootstrap_dev_admin.py`: `ENVIRONMENT=development`-gated, never imported or invoked by application code, not an HTTP endpoint (explicitly never a "forgot password" API), uses the real `hash_password` path. It changes only `password_hash` - role, team, and `is_active` are left exactly as they were, and it refuses to run against an email that doesn't exist rather than silently creating an account with an arbitrary role (account creation stays `bootstrap_dev_admin.py`'s job for `ADMIN`, or the real registration+promotion flow for everything else).
+
+**Reasoning**: the smallest addition that closes a real local-dev friction point without adding anything resembling a password-reset capability to the actual application - no email flow, no reset token, no new endpoint, nothing a production deployment could ever reach. Used live to regain access to a RESOLVER account (`support@university.com`) whose password had been set through the UI, not by any script; role/team (`RESOLVER`/`IT Support`) were confirmed unchanged by the reset.
+
+**Status**: active.
