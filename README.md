@@ -99,6 +99,14 @@ docker compose exec backend alembic upgrade head
 - Frontend: http://localhost:5173
 - PostgreSQL: localhost:5433 on the host (mapped from the container's 5432 to avoid clashing with any other local Postgres; user/db `resolve`)
 
+A fresh database has no `RESOLVER`/`ADMIN` account (registration always creates `USER` - DECISIONS.md D23). To reach admin-only UI/API locally:
+
+```bash
+docker compose exec backend python -m scripts.bootstrap_dev_admin
+```
+
+Prints a one-time local-development-only email/password to stdout (never written to a file). Development-only - refuses to run unless `ENVIRONMENT=development` (DECISIONS.md D49). `backend/scripts/seed_dev_reference_data.py` similarly seeds categories/teams/routing/SLA reference data so there's something for issues to route to.
+
 ### Without Docker
 
 Backend:

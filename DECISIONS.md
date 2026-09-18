@@ -624,3 +624,15 @@ Scope rule to avoid AI undoing human decisions: if the issue is still `status=OP
 **Reasoning**: found during the Phase 9 performance sanity pass ("obvious N+1 queries... unbounded list endpoints"). Verified with a query-counting regression test (`tests/test_issue_list_query_count.py`, using a `before_cursor_execute` listener on the real test connection) that asserts a small, fixed query count for a page of 8 issues each with distinct owner/category/team/resolver - confirmed to fail without the fix (by temporarily reverting it) and pass with it.
 
 **Status**: active.
+
+---
+
+## D49 — Local development ADMIN bootstrap script
+
+**Context**: end-to-end demonstration/verification of the full USER → RESOLVER → ADMIN product flow requires an actual ADMIN account to log in as, but D23 means nothing in the application itself can ever produce one - by design, `register_user` always creates `USER`, and the only way to get the first `ADMIN` had been a manual, undocumented, ad hoc direct database write, repeated (and thrown away afterward) during every prior phase's live verification.
+
+**Decision**: `backend/scripts/bootstrap_dev_admin.py`, following the exact isolation pattern already established by `seed_dev_reference_data.py`: refuses to run unless `ENVIRONMENT=development`; never imported or invoked by any application code path (no migration, no startup hook, no HTTP route references it - it is explicitly *not* an API endpoint and must never become one); idempotent (an existing account at the target email has its role left untouched, never silently re-promoted or reset); uses the real `hash_password` path, never a plaintext or weakened hash. It reads `DEV_ADMIN_EMAIL`/`DEV_ADMIN_PASSWORD` from the environment if set, otherwise defaults the email and generates a random password with `secrets.token_urlsafe`, printed once to stdout and never written to a file.
+
+**Reasoning**: the smallest change that closes a real, repeatedly-hit local-development gap without touching authentication, RBAC, or the registration API in any way - a script a developer runs by hand once, in the same spirit as the existing dev-only reference-data seed, not a new production surface. It cannot become a privilege-escalation path: it has no HTTP route, checks `ENVIRONMENT` the same way `seed_dev_reference_data.py` does, and a production deployment's first admin still requires the same one deliberate, human, direct-database action D23 always described - this script only replaces that action for local development, where it had been happening unscripted and undocumented anyway.
+
+**Status**: active.
