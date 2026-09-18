@@ -4,7 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from app.models.enums import AIAnalysisStatus, IssuePriority, IssueStatus
+from app.models.enums import AIAnalysisStatus, IssuePriority, IssueStatus, StatusChangeTrigger
 from app.schemas.user import TeamPublic
 
 if TYPE_CHECKING:
@@ -154,6 +154,18 @@ class AssignmentUpdateRequest(BaseModel):
             return None
         value = value.strip()
         return value or None
+
+
+class IssueStatusHistoryPublic(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    previous_status: Optional[IssueStatus] = None
+    new_status: IssueStatus
+    trigger: StatusChangeTrigger
+    changed_by: Optional[UserSummary] = None
+    note: Optional[str] = None
+    created_at: datetime
 
 
 class IssueStatusUpdateRequest(BaseModel):

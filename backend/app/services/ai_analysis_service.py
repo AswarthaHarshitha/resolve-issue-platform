@@ -24,7 +24,7 @@ from app.models.user import User
 from app.repositories import issue_repository
 from app.services.ai_provider import AIProvider, AIProviderError, AIResponseFormatError, get_default_provider
 from app.services.ai_validation import AIValidationError, validate_ai_suggestion
-from app.services.issue_service import IssueNotFoundError
+from app.services.issue_service import IssueAccessDeniedError, IssueNotFoundError, can_access_issue
 from app.services.routing_service import route_issue
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,25 @@ class ReanalyzeCooldownError(Exception):
 
 class ReanalyzeInProgressError(Exception):
     pass
+
+
+def get_latest_analysis_result(db: Session, *, issue_id: UUID, current_user: User):
+    """The most recent classification attempt for an issue, for display on
+    the issue detail page - `None` if AI analysis hasn't completed (or
+    failed) yet at all. Access-gated the same way as everything else on
+    the issue."""
+    issue = issue_repository.get_issue_by_id(db, issue_id)
+    if issue is None:
+        raise IssueNotFoundError()
+    if not can_access_issue(issue, current_user):
+        raise IssueAccessDeniedError()
+
+    return (
+        db.query(AIAnalysisResult)
+        .filter(AIAnalysisResult.issue_id == issue_id)
+        .order_by(AIAnalysisResult.attempt_number.desc())
+        .first()
+    )
 
 
 def _next_attempt_number(db: Session, issue_id: UUID) -> int:

@@ -262,3 +262,48 @@ def test_issue_stays_usable_and_commentable_while_ai_analysis_is_failed(client, 
     response = client.get(f"/api/v1/issues/{issue.id}", headers=auth_headers(owner))
     assert response.status_code == 200
     assert response.json()["status"] == "OPEN"
+
+
+def test_ai_analysis_endpoint_returns_the_latest_attempt(client, db_session, ai_session_factory):
+    owner = make_user_with_role(db_session, "USER", "ai-owner11@example.com")
+    make_category(db_session, "IT")
+    issue = make_issue(db_session, owner)
+    db_session.commit()
+
+    run_ai_analysis(
+        issue.id,
+        provider=FakeAIProvider(
+            suggestion=AISuggestion(category="IT", sub_category=None, priority="LOW", summary="s1", reasoning="r1")
+        ),
+        session_factory=ai_session_factory,
+    )
+
+    response = client.get(f"/api/v1/issues/{issue.id}/ai-analysis", headers=auth_headers(owner))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "COMPLETED"
+    assert body["summary"] == "s1"
+    assert body["reasoning"] == "r1"
+
+
+def test_ai_analysis_endpoint_returns_null_before_any_attempt(client, db_session):
+    owner = make_user_with_role(db_session, "USER", "ai-owner12@example.com")
+    issue = make_issue(db_session, owner)
+    db_session.commit()
+
+    response = client.get(f"/api/v1/issues/{issue.id}/ai-analysis", headers=auth_headers(owner))
+
+    assert response.status_code == 200
+    assert response.json() is None
+
+
+def test_ai_analysis_endpoint_requires_access(client, db_session):
+    owner = make_user_with_role(db_session, "USER", "ai-owner13@example.com")
+    other = make_user_with_role(db_session, "USER", "ai-other13@example.com")
+    issue = make_issue(db_session, owner)
+    db_session.commit()
+
+    response = client.get(f"/api/v1/issues/{issue.id}/ai-analysis", headers=auth_headers(other))
+
+    assert response.status_code == 403

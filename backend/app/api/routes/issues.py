@@ -9,12 +9,14 @@ from app.core.deps import get_current_user
 from app.db.session import get_db
 from app.models.enums import IssueStatus
 from app.models.user import User
+from app.schemas.ai_analysis import AIAnalysisResultPublic
 from app.schemas.comment import CommentCreateRequest, CommentPublic
 from app.schemas.issue import (
     AssignmentUpdateRequest,
     IssueCreateRequest,
     IssueListResponse,
     IssuePublic,
+    IssueStatusHistoryPublic,
     IssueStatusUpdateRequest,
     build_issue_public,
 )
@@ -174,6 +176,22 @@ def list_comments(
         )
 
 
+@router.get("/{issue_id}/ai-analysis", response_model=Optional[AIAnalysisResultPublic])
+def get_ai_analysis(
+    issue_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return ai_analysis_service.get_latest_analysis_result(db, issue_id=issue_id, current_user=current_user)
+    except issue_service.IssueNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found")
+    except issue_service.IssueAccessDeniedError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="You do not have access to this issue"
+        )
+
+
 @router.patch("/{issue_id}/assignment", response_model=IssuePublic)
 def update_assignment(
     issue_id: UUID,
@@ -240,3 +258,19 @@ def reject_resolution(
         )
     except issue_service.InvalidStatusTransitionError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.get("/{issue_id}/history", response_model=list[IssueStatusHistoryPublic])
+def get_status_history(
+    issue_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[IssueStatusHistoryPublic]:
+    try:
+        return issue_service.get_status_history(db, issue_id=issue_id, current_user=current_user)
+    except issue_service.IssueNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found")
+    except issue_service.IssueAccessDeniedError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="You do not have access to this issue"
+        )

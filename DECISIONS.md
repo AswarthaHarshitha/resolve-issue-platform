@@ -534,3 +534,33 @@ Scope rule to avoid AI undoing human decisions: if the issue is still `status=OP
 **Reasoning**: each of these four pieces reuses machinery already built rather than inventing new patterns - the row lock from D12/D31, the SLA pause functions from D40, the same `can_access_issue` predicate for viewing/transitioning/commenting. That reuse is itself the argument for correctness: there's exactly one definition of "can this person touch this issue," so it can't drift between the four surfaces that need to ask the question.
 
 **Status**: active.
+
+---
+
+## D42 — Admin management endpoints: the real replacement for manual database inserts
+
+**Context**: every prior phase's manual/live verification had to insert a RESOLVER or ADMIN user directly into the database with raw SQL, because no code path could create one (D23: public registration always creates `USER`). That gap was explicitly called out as a known limitation in the README after Phases 3, 4, 5, 6, and 7. Phase 8 is where it finally closes.
+
+**Decision**: `app/api/routes/admin.py`, entirely gated by `require_admin` at the router level (one `dependencies=[Depends(require_admin)]` on the `APIRouter`, not repeated per endpoint). CRUD for `teams`, `categories`/`sub_categories`, `routing_rules`, `sla_rules`, and `PATCH /admin/users/{id}` for role/team/`is_active`. Three rules enforced in `admin_service.py`, not left to chance:
+- **No hard deletes anywhere** - every "remove" is `is_active=False`, consistent with D15. There is no `DELETE` verb on any admin endpoint.
+- **Role changes stay consistent with D18's team-per-resolver invariant**: promoting a user to `RESOLVER` without a team_id (new or already set) is rejected (`ValidationError` → 400); demoting a `RESOLVER` away from that role clears their `team_id`, since a team assignment is meaningless for a `USER` or `ADMIN`. This is the "real provisioning entry point" D18 said the app-layer check belonged at - it didn't exist until now.
+- **Role strings are validated against the real role set** (`ALL_ROLE_NAMES` from D20), not accepted as arbitrary text - `{"role": "SUPERUSER"}` is a 400, not a silently-broken foreign key lookup.
+
+**Reasoning**: this is the first phase where "grant someone elevated access" has an actual, tested, audited code path instead of a documented workaround. It was verified end to end with real HTTP requests (not just unit tests): an ADMIN promotes a `USER` to `RESOLVER` with a team, the promoted user's next login and every subsequent request reflects the new role immediately (D21's fresh-reload guarantee applies here too - no re-issued token needed), the promoted user gets exactly `RESOLVER` access (not `ADMIN`), and a plain `USER` attempting the same promotion endpoint - on themselves or on someone else - is rejected with 403 by the same `require_admin` dependency every other admin surface uses. No new authorization pattern was invented for this; it's D24's role-based RBAC dependency, applied to one more router.
+
+**Status**: active.
+
+---
+
+## D43 — Dashboard metrics: real queries only, at-risk as a list not just a count, admin-only team workload
+
+**Context**: the Phase 8 spec is explicit that every dashboard number must come from an actual database query - no placeholder figures - and that "SLA at risk" should be a prioritized list a resolver can act on, not only a tile showing a number.
+
+**Decision**: `dashboard_service.py` exposes three real queries, all scoped by the identical role rule as issue listing (`can_access_issue`'s scope, D41) so a dashboard never shows a USER, RESOLVER, or ADMIN anything they couldn't also see by opening the issue directly:
+- `get_summary`: open-request count, high-priority count, SLA-at-risk count (via `compute_sla_status`, same function D40 built - no second definition of "at risk"), and issues resolved today (`resolved_at >= today's UTC midnight`).
+- `get_at_risk_issues`: the actual issues behind that count, sorted by resolution deadline, sharing its scoping helper with `get_summary` (`_open_issues_with_sla_in_scope`) so the tile and the list can never disagree about which issues qualify.
+- `get_breakdown`: status counts and priority counts (both scoped), AI-analysis failure count, and - ADMIN only - team workload (a `GROUP BY` over currently-open issues per team). Team workload is admin-only because it inherently spans every team; a resolver's own dashboard already shows their team's issues directly.
+
+**Reasoning**: computing "at risk" by iterating open issues with an SLA record in Python (rather than a single SQL aggregate) is a deliberate, documented tradeoff - the underlying computation (D40's pause-aware effective-elapsed math) isn't expressible as a plain column comparison, and at this project's real scale (a portfolio-sized deployment, not enterprise issue volume) the cost is negligible. It's flagged in the code as a scale consideration precisely so it isn't mistaken for something that would stay cheap at very large issue counts.
+
+**Status**: active.

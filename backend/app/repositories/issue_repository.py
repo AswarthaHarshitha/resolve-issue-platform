@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.models.enums import IssueStatus
 from app.models.issue import Issue
+from app.models.issue_status_history import IssueStatusHistory
 
 
 def create_issue(db: Session, *, owner_id: UUID, title: str, description: str) -> Issue:
@@ -64,3 +65,12 @@ def list_issues(
     items = list(db.execute(stmt).scalars().all())
 
     return items, total
+
+
+def list_status_history(db: Session, issue_id: UUID) -> List[IssueStatusHistory]:
+    stmt = (
+        select(IssueStatusHistory)
+        .where(IssueStatusHistory.issue_id == issue_id)
+        .order_by(IssueStatusHistory.created_at)
+    )
+    return list(db.execute(stmt).scalars().all())

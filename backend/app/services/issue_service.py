@@ -220,3 +220,12 @@ def reject_resolution(db: Session, *, issue_id: UUID, current_user: User, note: 
     db.commit()
     db.refresh(issue)
     return issue
+
+
+def get_status_history(db: Session, *, issue_id: UUID, current_user: User):
+    issue = issue_repository.get_issue_by_id(db, issue_id)
+    if issue is None:
+        raise IssueNotFoundError()
+    if not can_access_issue(issue, current_user):
+        raise IssueAccessDeniedError()
+    return issue_repository.list_status_history(db, issue_id)
