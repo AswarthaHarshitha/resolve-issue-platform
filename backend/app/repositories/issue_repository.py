@@ -1,7 +1,7 @@
 from typing import List, Optional, Tuple
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models.enums import IssueStatus
@@ -36,12 +36,21 @@ def list_issues(
     status_filter: Optional[IssueStatus],
     page: int,
     page_size: int,
+    team_scope: Optional[UUID] = None,
+    include_unassigned_for_team_scope: bool = False,
 ) -> Tuple[List[Issue], int]:
     filters = []
     if owner_id is not None:
         filters.append(Issue.owner_id == owner_id)
     if status_filter is not None:
         filters.append(Issue.status == status_filter)
+    if team_scope is not None or include_unassigned_for_team_scope:
+        # Mirrors issue_service.can_access_issue exactly: a resolver's list
+        # must show precisely what they're also allowed to open individually.
+        if include_unassigned_for_team_scope:
+            filters.append(or_(Issue.current_team_id.is_(None), Issue.current_team_id == team_scope))
+        else:
+            filters.append(Issue.current_team_id == team_scope)
 
     count_stmt = select(func.count()).select_from(Issue)
     for condition in filters:

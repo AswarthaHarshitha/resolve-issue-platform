@@ -1,12 +1,10 @@
 """Issue creation, retrieval, and status-transition business logic.
 
-Authorization here is deliberately coarse-grained for Phase 4: a USER may
-only see their own issues; a RESOLVER or ADMIN may see and transition any
-issue. There is no team-scoped restriction yet because there is nothing to
-scope by - routing (which sets an issue's current_team_id) doesn't exist
-until Phase 5, and Phase 7 is where resolver access gets narrowed to "only
-issues assigned to my team." This is a documented, intentional simplification
-(DECISIONS.md D24), not an oversight.
+Authorization (DECISIONS.md D29, narrowed in D41): a USER may only see/act
+on their own issues. An ADMIN may see/act on any issue. A RESOLVER may
+see/act on an issue only if it is unassigned (current_team_id is NULL - so
+nothing is ever invisible while waiting to be routed/picked up) or assigned
+to their own team - never another team's issue.
 """
 
 from datetime import datetime, timezone
@@ -23,8 +21,6 @@ from app.models.user import User
 from app.repositories import issue_repository
 from app.services import sla_service
 from app.services.status_transition_rules import is_transition_allowed
-
-_STAFF_ROLES = (RoleName.RESOLVER, RoleName.ADMIN)
 
 
 class IssueNotFoundError(Exception):
@@ -63,9 +59,18 @@ def create_issue(db: Session, *, owner: User, title: str, description: str) -> I
     return issue
 
 
-def _can_view_issue(issue: Issue, user: User) -> bool:
-    if user.role.name in _STAFF_ROLES:
+def can_access_issue(issue: Issue, user: User) -> bool:
+    """The one place issue-level authorization is decided - reused by
+    viewing, commenting, and transitioning, so the rule can't drift between
+    them (DECISIONS.md D41)."""
+    if user.role.name == RoleName.ADMIN:
         return True
+    if user.role.name == RoleName.RESOLVER:
+        # Unassigned issues stay visible to every resolver (so someone can
+        # notice and pick them up - "not silently dropped," per the
+        # original architecture review); an issue assigned to a specific
+        # team is only visible to that team's resolvers.
+        return issue.current_team_id is None or issue.current_team_id == user.team_id
     return issue.owner_id == user.id
 
 
@@ -73,7 +78,7 @@ def get_issue_for_user(db: Session, *, issue_id: UUID, current_user: User) -> Is
     issue = issue_repository.get_issue_by_id(db, issue_id)
     if issue is None:
         raise IssueNotFoundError()
-    if not _can_view_issue(issue, current_user):
+    if not can_access_issue(issue, current_user):
         raise IssueAccessDeniedError()
     return issue
 
@@ -86,12 +91,24 @@ def list_issues_for_user(
     page_size: int,
     status_filter: Optional[IssueStatus],
 ) -> Tuple[List[Issue], int]:
-    # A USER's results are forced to their own issues regardless of what a
-    # client might otherwise try to request - there is no "owner_id" query
-    # parameter a USER can pass to see someone else's issues.
-    owner_id = None if current_user.role.name in _STAFF_ROLES else current_user.id
+    if current_user.role.name == RoleName.ADMIN:
+        owner_id, team_scope = None, None
+    elif current_user.role.name == RoleName.RESOLVER:
+        # Their own team's issues, plus anything still unassigned - matches
+        # can_access_issue exactly, so "what I can list" and "what I can
+        # open" never disagree.
+        owner_id, team_scope = None, current_user.team_id
+    else:
+        owner_id, team_scope = current_user.id, None
+
     return issue_repository.list_issues(
-        db, owner_id=owner_id, status_filter=status_filter, page=page, page_size=page_size
+        db,
+        owner_id=owner_id,
+        team_scope=team_scope,
+        include_unassigned_for_team_scope=current_user.role.name == RoleName.RESOLVER,
+        status_filter=status_filter,
+        page=page,
+        page_size=page_size,
     )
 
 
@@ -103,12 +120,15 @@ def transition_status(
     current_user: User,
     note: Optional[str] = None,
 ) -> Issue:
-    if current_user.role.name not in _STAFF_ROLES:
+    if current_user.role.name not in (RoleName.RESOLVER, RoleName.ADMIN):
         raise IssueAccessDeniedError()
 
     issue = issue_repository.get_issue_by_id_for_update(db, issue_id)
     if issue is None:
         raise IssueNotFoundError()
+
+    if not can_access_issue(issue, current_user):
+        raise IssueAccessDeniedError()
 
     if not is_transition_allowed(issue.status, target_status):
         raise InvalidStatusTransitionError(issue.status, target_status)
@@ -132,6 +152,66 @@ def transition_status(
             issue_id=issue.id,
             previous_status=previous_status,
             new_status=target_status,
+            trigger=StatusChangeTrigger.MANUAL,
+            changed_by_id=current_user.id,
+            note=note,
+        )
+    )
+    db.commit()
+    db.refresh(issue)
+    return issue
+
+
+def confirm_resolution(db: Session, *, issue_id: UUID, current_user: User) -> Issue:
+    """The only path to CLOSED (DECISIONS.md D9, D30) - the issue's own
+    owner, and only the owner, may confirm. A resolver/admin marking an
+    issue RESOLVED (via transition_status) never closes it by itself."""
+    issue = issue_repository.get_issue_by_id_for_update(db, issue_id)
+    if issue is None:
+        raise IssueNotFoundError()
+    if issue.owner_id != current_user.id:
+        raise IssueAccessDeniedError()
+    if issue.status != IssueStatus.RESOLVED:
+        raise InvalidStatusTransitionError(issue.status, IssueStatus.CLOSED)
+
+    previous_status = issue.status
+    issue.status = IssueStatus.CLOSED
+    issue.closed_at = datetime.now(timezone.utc)
+    db.add(
+        IssueStatusHistory(
+            issue_id=issue.id,
+            previous_status=previous_status,
+            new_status=IssueStatus.CLOSED,
+            trigger=StatusChangeTrigger.MANUAL,
+            changed_by_id=current_user.id,
+        )
+    )
+    db.commit()
+    db.refresh(issue)
+    return issue
+
+
+def reject_resolution(db: Session, *, issue_id: UUID, current_user: User, note: Optional[str] = None) -> Issue:
+    """The owner disagrees the issue is actually resolved - returns it to
+    IN_PROGRESS (an active state a resolver can act on again) rather than
+    leaving it stuck at RESOLVED with nowhere to go. Only the owner may
+    reject, for the same reason only the owner may confirm."""
+    issue = issue_repository.get_issue_by_id_for_update(db, issue_id)
+    if issue is None:
+        raise IssueNotFoundError()
+    if issue.owner_id != current_user.id:
+        raise IssueAccessDeniedError()
+    if issue.status != IssueStatus.RESOLVED:
+        raise InvalidStatusTransitionError(issue.status, IssueStatus.IN_PROGRESS)
+
+    previous_status = issue.status
+    issue.status = IssueStatus.IN_PROGRESS
+    issue.resolved_at = None
+    db.add(
+        IssueStatusHistory(
+            issue_id=issue.id,
+            previous_status=previous_status,
+            new_status=IssueStatus.IN_PROGRESS,
             trigger=StatusChangeTrigger.MANUAL,
             changed_by_id=current_user.id,
             note=note,

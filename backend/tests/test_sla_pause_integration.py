@@ -17,7 +17,10 @@ from app.services.ai_provider import AISuggestion
 
 def _routed_issue(client, db_session, ai_session_factory, owner):
     """Creates and routes an issue via the real pipeline, ending ASSIGNED
-    with a real sla_records row - the state every pause test starts from."""
+    with a real sla_records row - the state every pause test starts from.
+    Returns (issue_id, team) - callers must create their resolver fixture
+    on this same team, since team-scoped access (DECISIONS.md D41) means a
+    resolver on a different (or no) team cannot act on a routed issue."""
     from app.models.routing_rule import RoutingRule
     from tests.factories import make_team
 
@@ -45,7 +48,7 @@ def _routed_issue(client, db_session, ai_session_factory, owner):
         ),
         session_factory=ai_session_factory,
     )
-    return issue_id
+    return issue_id, team
 
 
 def _advance_to_in_progress(client, resolver, issue_id):
@@ -61,8 +64,8 @@ def _advance_to_in_progress(client, resolver, issue_id):
 
 def test_entering_waiting_for_user_opens_a_pause(client, db_session, ai_session_factory):
     owner = make_user_with_role(db_session, "USER", "sla-pause-owner1@example.com")
-    resolver = make_user_with_role(db_session, "RESOLVER", "sla-pause-resolver1@example.com")
-    issue_id = _routed_issue(client, db_session, ai_session_factory, owner)
+    issue_id, team = _routed_issue(client, db_session, ai_session_factory, owner)
+    resolver = make_user_with_role(db_session, "RESOLVER", "sla-pause-resolver1@example.com", team=team)
     _advance_to_in_progress(client, resolver, issue_id)
 
     response = client.patch(
@@ -79,8 +82,8 @@ def test_entering_waiting_for_user_opens_a_pause(client, db_session, ai_session_
 
 def test_leaving_waiting_for_user_closes_the_pause_and_accumulates_duration(client, db_session, ai_session_factory):
     owner = make_user_with_role(db_session, "USER", "sla-pause-owner2@example.com")
-    resolver = make_user_with_role(db_session, "RESOLVER", "sla-pause-resolver2@example.com")
-    issue_id = _routed_issue(client, db_session, ai_session_factory, owner)
+    issue_id, team = _routed_issue(client, db_session, ai_session_factory, owner)
+    resolver = make_user_with_role(db_session, "RESOLVER", "sla-pause-resolver2@example.com", team=team)
     _advance_to_in_progress(client, resolver, issue_id)
 
     client.patch(f"/api/v1/issues/{issue_id}/status", json={"status": "WAITING_FOR_USER"}, headers=auth_headers(resolver))
@@ -114,8 +117,8 @@ def test_multiple_pause_cycles_accumulate(client, db_session, ai_session_factory
     duration (covered precisely by tests/test_sla_service.py's unit tests
     using constructed timestamps instead of real wall-clock time)."""
     owner = make_user_with_role(db_session, "USER", "sla-pause-owner3@example.com")
-    resolver = make_user_with_role(db_session, "RESOLVER", "sla-pause-resolver3@example.com")
-    issue_id = _routed_issue(client, db_session, ai_session_factory, owner)
+    issue_id, team = _routed_issue(client, db_session, ai_session_factory, owner)
+    resolver = make_user_with_role(db_session, "RESOLVER", "sla-pause-resolver3@example.com", team=team)
     _advance_to_in_progress(client, resolver, issue_id)
 
     for _ in range(2):
@@ -144,8 +147,8 @@ def test_pause_intervals_never_overlap_even_across_cycles(client, db_session, ai
     not just in the Phase 2 schema tests: each WAITING_FOR_USER cycle must
     produce a genuinely separate, non-overlapping interval."""
     owner = make_user_with_role(db_session, "USER", "sla-pause-owner4@example.com")
-    resolver = make_user_with_role(db_session, "RESOLVER", "sla-pause-resolver4@example.com")
-    issue_id = _routed_issue(client, db_session, ai_session_factory, owner)
+    issue_id, team = _routed_issue(client, db_session, ai_session_factory, owner)
+    resolver = make_user_with_role(db_session, "RESOLVER", "sla-pause-resolver4@example.com", team=team)
     _advance_to_in_progress(client, resolver, issue_id)
 
     client.patch(f"/api/v1/issues/{issue_id}/status", json={"status": "WAITING_FOR_USER"}, headers=auth_headers(resolver))
@@ -190,15 +193,25 @@ def test_concurrent_waiting_for_user_entry_opens_exactly_one_pause(test_engine):
         user_role = setup_session.query(Role).filter_by(name="USER").one()
         resolver_role = setup_session.query(Role).filter_by(name="RESOLVER").one()
 
+        category = Category(name=f"RaceCat-{uuid.uuid4().hex[:8]}")
+        team = Team(name=f"RaceTeam-{uuid.uuid4().hex[:8]}")
+        setup_session.add_all([category, team])
+        setup_session.flush()
+
         owner = UserModel(
             email="sla-race-owner@example.com", password_hash="x", full_name="Owner", role_id=user_role.id
         )
+        # Team-scoped access (DECISIONS.md D41): this resolver must be on
+        # the same team the issue gets routed to, or every transition
+        # attempt below would be rejected before the race even matters.
         resolver = UserModel(
-            email="sla-race-resolver@example.com", password_hash="x", full_name="Resolver", role_id=resolver_role.id
+            email="sla-race-resolver@example.com",
+            password_hash="x",
+            full_name="Resolver",
+            role_id=resolver_role.id,
+            team_id=team.id,
         )
-        category = Category(name=f"RaceCat-{uuid.uuid4().hex[:8]}")
-        team = Team(name=f"RaceTeam-{uuid.uuid4().hex[:8]}")
-        setup_session.add_all([owner, resolver, category, team])
+        setup_session.add_all([owner, resolver])
         setup_session.flush()
 
         setup_session.add(RoutingRule(category_id=category.id, sub_category_id=None, team_id=team.id))
@@ -239,6 +252,15 @@ def test_concurrent_waiting_for_user_entry_opens_exactly_one_pause(test_engine):
         barrier = threading.Barrier(2)
 
         def attempt_waiting_for_user(key):
+            # An exception raised inside a thread never propagates to the
+            # main test thread - it would otherwise silently skip setting
+            # results[key] and, worse, be silently swallowed instead of
+            # failing the test, which is exactly what let a fixture bug
+            # (the resolver missing team_id, before this test's fix) leave
+            # committed rows behind uncleaned in an earlier run. Recording
+            # any exception here, not just the expected one, means a
+            # regression shows up as a clear assertion failure below
+            # instead of a silent no-op.
             with Session(bind=setup_engine) as session:
                 resolver_ref = session.get(UserModel, resolver_id)
                 barrier.wait()
@@ -249,6 +271,8 @@ def test_concurrent_waiting_for_user_entry_opens_exactly_one_pause(test_engine):
                     results[key] = "succeeded"
                 except InvalidStatusTransitionError:
                     results[key] = "rejected"
+                except Exception as exc:  # noqa: BLE001 - intentionally broad, see comment above
+                    results[key] = f"unexpected: {exc!r}"
 
         thread_a = threading.Thread(target=attempt_waiting_for_user, args=("a",))
         thread_b = threading.Thread(target=attempt_waiting_for_user, args=("b",))

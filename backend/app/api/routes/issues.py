@@ -9,14 +9,16 @@ from app.core.deps import get_current_user
 from app.db.session import get_db
 from app.models.enums import IssueStatus
 from app.models.user import User
+from app.schemas.comment import CommentCreateRequest, CommentPublic
 from app.schemas.issue import (
+    AssignmentUpdateRequest,
     IssueCreateRequest,
     IssueListResponse,
     IssuePublic,
     IssueStatusUpdateRequest,
     build_issue_public,
 )
-from app.services import ai_analysis_service, issue_service
+from app.services import ai_analysis_service, assignment_service, comment_service, issue_service
 from app.services.ai_analysis_service import run_ai_analysis
 
 router = APIRouter(prefix="/issues", tags=["issues"])
@@ -134,3 +136,107 @@ def reanalyze_issue(
 
     background_tasks.add_task(run_ai_analysis, issue.id)
     return build_issue_public(issue)
+
+
+@router.post("/{issue_id}/comments", response_model=CommentPublic, status_code=status.HTTP_201_CREATED)
+def add_comment(
+    issue_id: UUID,
+    payload: CommentCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> CommentPublic:
+    try:
+        comment, _issue = comment_service.add_comment(
+            db, issue_id=issue_id, author=current_user, body=payload.body
+        )
+        return comment
+    except issue_service.IssueNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found")
+    except issue_service.IssueAccessDeniedError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="You do not have access to this issue"
+        )
+
+
+@router.get("/{issue_id}/comments", response_model=list[CommentPublic])
+def list_comments(
+    issue_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[CommentPublic]:
+    try:
+        return comment_service.list_comments(db, issue_id=issue_id, current_user=current_user)
+    except issue_service.IssueNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found")
+    except issue_service.IssueAccessDeniedError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="You do not have access to this issue"
+        )
+
+
+@router.patch("/{issue_id}/assignment", response_model=IssuePublic)
+def update_assignment(
+    issue_id: UUID,
+    payload: AssignmentUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> IssuePublic:
+    try:
+        issue = assignment_service.update_assignment(
+            db,
+            issue_id=issue_id,
+            current_user=current_user,
+            team_id=payload.team_id,
+            resolver_id=payload.resolver_id,
+            reason=payload.reason,
+        )
+        return build_issue_public(issue)
+    except issue_service.IssueNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found")
+    except assignment_service.AssignmentAccessDeniedError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc) or "Not permitted")
+    except assignment_service.InvalidAssignmentError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post("/{issue_id}/resolution/confirm", response_model=IssuePublic)
+def confirm_resolution(
+    issue_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> IssuePublic:
+    try:
+        issue = issue_service.confirm_resolution(db, issue_id=issue_id, current_user=current_user)
+        return build_issue_public(issue)
+    except issue_service.IssueNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found")
+    except issue_service.IssueAccessDeniedError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the issue's submitter may confirm its resolution",
+        )
+    except issue_service.InvalidStatusTransitionError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post("/{issue_id}/resolution/reject", response_model=IssuePublic)
+def reject_resolution(
+    issue_id: UUID,
+    payload: IssueStatusUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> IssuePublic:
+    try:
+        issue = issue_service.reject_resolution(
+            db, issue_id=issue_id, current_user=current_user, note=payload.note
+        )
+        return build_issue_public(issue)
+    except issue_service.IssueNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found")
+    except issue_service.IssueAccessDeniedError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the issue's submitter may reject its resolution",
+        )
+    except issue_service.InvalidStatusTransitionError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))

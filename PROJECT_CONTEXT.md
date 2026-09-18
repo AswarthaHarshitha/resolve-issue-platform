@@ -134,10 +134,13 @@ issues ─┬─< issue_comments >─ users (author)
 - `GET /api/v1/auth/me` — requires a valid JWT. Returns the caller's own profile (role, team) loaded fresh from the database.
 - `POST /api/v1/auth/logout` — requires a valid JWT. Stateless: confirms the request, invalidates nothing server-side (see DECISIONS.md D22).
 - `POST /api/v1/issues` — any authenticated user. Creates an issue (`status=OPEN`, `ai_analysis_status=PENDING`), commits, returns, **then** schedules AI analysis as a background task (DECISIONS.md D3, D32 superseded by D33–D39).
-- `GET /api/v1/issues` — any authenticated user. Paginated, optional `status` filter. A `USER` only ever sees their own issues (forced server-side); `RESOLVER`/`ADMIN` see all (coarse-grained — DECISIONS.md D29).
-- `GET /api/v1/issues/{id}` — owner, or any `RESOLVER`/`ADMIN`. 404 if the issue doesn't exist, 403 if it exists but the caller can't see it.
-- `PATCH /api/v1/issues/{id}/status` — `RESOLVER`/`ADMIN` only. Validates the target against the D8 transition table using a freshly row-locked read (D12/D31); structurally cannot reach `CLOSED` (reserved for Phase 7's confirmation flow — D30).
+- `GET /api/v1/issues` — any authenticated user. Paginated, optional `status` filter. A `USER` only ever sees their own issues (forced server-side); `RESOLVER` sees their own team's issues plus anything still unassigned; `ADMIN` sees all (team-scoped — DECISIONS.md D41, narrowing D29).
+- `GET /api/v1/issues/{id}` — owner, `RESOLVER` on the issue's team (or if it's unassigned), or `ADMIN`. 404 if the issue doesn't exist, 403 if it exists but the caller can't see it.
+- `PATCH /api/v1/issues/{id}/status` — `RESOLVER`/`ADMIN` only, and (for a `RESOLVER`) only on their own team's issue. Validates the target against the D8 transition table using a freshly row-locked read (D12/D31); structurally cannot reach `CLOSED` (reserved for the confirmation flow — D30, D41).
 - `POST /api/v1/issues/{id}/reanalyze` — `RESOLVER`/`ADMIN` only. 404/403/409 (already `PROCESSING`)/429 (`Retry-After` header, cooldown) as appropriate; on success, `202` and a new background analysis attempt. Only re-routes if the issue is still `OPEN` (DECISIONS.md D13, D38).
+- `POST /api/v1/issues/{id}/comments` / `GET /api/v1/issues/{id}/comments` — anyone who can access the issue. Posting a comment as the issue's owner while it is `WAITING_FOR_USER` atomically resumes it to `IN_PROGRESS` and closes the SLA pause (DECISIONS.md D11, D41) — no one else's comment does.
+- `PATCH /api/v1/issues/{id}/assignment` — `ADMIN` (any team/resolver, with the resolver validated to belong to the target team) or `RESOLVER` (self-assign only, own team only). Every call appends a new `issue_assignments` row (DECISIONS.md D7, D41).
+- `POST /api/v1/issues/{id}/resolution/confirm` / `.../reject` — issue owner only, even an `ADMIN` cannot call these. Confirm: `RESOLVED → CLOSED`. Reject: `RESOLVED → IN_PROGRESS` (DECISIONS.md D9, D41).
 - `GET /api/v1/_rbac-demo/{user-only|resolver-only|admin-only|resolver-or-admin}` — still temporary. Kept alongside the issue endpoints because no issue endpoint is ADMIN-only or USER-only specifically, so this remains the only way to test those particular role combinations over real HTTP; will be removed once a real admin-only endpoint exists (e.g. Phase 8 admin management).
 
 Remaining endpoints defined in detail as later phases build them.
@@ -184,7 +187,7 @@ OPEN → TRIAGED → ASSIGNED → IN_PROGRESS ⇄ WAITING_FOR_USER → RESOLVED
 
 **Concurrency**: `issue_repository.get_issue_by_id_for_update` uses `SELECT ... FOR UPDATE` inside the transition transaction, so a concurrent transition request on the same issue blocks until the first commits, then validates against whatever that first request actually left behind — never a stale or client-supplied status (DECISIONS.md D12, D31). Verified with a real two-thread, two-connection test against a genuinely shared row, not the test suite's usual rollback-isolated session.
 
-**Authorization**: coarse-grained for now (DECISIONS.md D29) — a `USER` can only see their own issues (owner_id filter forced server-side, no way to request otherwise); `RESOLVER`/`ADMIN` can see and transition *any* issue, with no team-scoping yet since routing (Phase 5) is what will populate `current_team_id`, and Phase 7 is where resolver access narrows to "my team's issues only."
+**Authorization**: team-scoped as of Phase 7 (DECISIONS.md D41, narrowing D29) — see the RESOLVER WORKFLOW section below for the current rule.
 
 ## AI ANALYSIS & ROUTING (Phase 5 — implemented and tested)
 
@@ -241,6 +244,23 @@ Verified to reconstruct identically after a simulated restart (`session.expire_a
 
 **Concurrency**: entering `WAITING_FOR_USER` inherits the same `SELECT ... FOR UPDATE` serialization as every other transition (D12/D31) — verified with a real two-thread/two-connection test that only one of two simultaneous `IN_PROGRESS → WAITING_FOR_USER` requests can succeed, and exactly one pause interval is ever opened. The database's exclusion constraint (D19) remains the final backstop.
 
+## RESOLVER WORKFLOW (Phase 7 — implemented and tested)
+
+**Team-scoped access** (DECISIONS.md D41, narrowing D29): `issue_service.can_access_issue` is the single place this is decided, reused by viewing, transitioning, and commenting alike.
+```
+ADMIN    → always
+RESOLVER → issue.current_team_id is None (unassigned - visible to all, so it can be
+            picked up) OR issue.current_team_id == user.team_id
+USER     → issue.owner_id == user.id
+```
+`list_issues_for_user` mirrors this exactly, so a resolver's list and what they can individually open never disagree.
+
+**Comments and the CRITICAL SPECIAL RULE**: `POST/GET /issues/{id}/comments`, access-gated by `can_access_issue`. `comment_service.add_comment` loads the issue under the same `SELECT ... FOR UPDATE` every other mutation uses; if the issue is currently `WAITING_FOR_USER` and the commenter is the issue's own owner, it atomically also transitions the issue to `IN_PROGRESS` and closes the SLA pause (reusing `sla_service.close_pause`) in the same transaction as the comment insert. A resolver, admin, or anyone else commenting never triggers this. Verified live: a resolver's comment while `WAITING_FOR_USER` left the issue unchanged; the owner's comment moved it to `IN_PROGRESS` and correctly closed the pause.
+
+**Assignment**: `PATCH /issues/{id}/assignment`. `ADMIN` can set `team_id` and/or `resolver_id` to anything, with the assigned resolver validated to actually belong to the target team. `RESOLVER` can only self-assign (`resolver_id` must be their own id) on an issue already on their own team, and cannot change `team_id`. Every call appends a new `issue_assignments` row (never overwrites — D7); `issues.current_team_id`/`current_resolver_id` are updated in the same transaction. Assignment is independent of status — reassigning never itself changes `status`.
+
+**Resolution confirmation** (DECISIONS.md D9, D30, D41): `POST /issues/{id}/resolution/confirm` and `.../reject`, both restricted to the issue's own owner — no admin override exists. Confirm requires `status == RESOLVED`, moves to `CLOSED`, sets `closed_at`. Reject requires the same precondition and returns the issue to `IN_PROGRESS` with an optional note. The generic `PATCH .../status` endpoint (resolver/admin-only) still cannot reach `CLOSED` under any circumstance — verified explicitly, not just assumed.
+
 ## ARCHITECTURE
 Layered monolith (Option A, see DECISIONS.md): single FastAPI service, single React SPA, single Postgres database.
 Backend layout: `app/{main, api, core, models, schemas, services, repositories, db, tests}`.
@@ -259,19 +279,19 @@ Never `User Issue → AI → blindly trust → persist`.
 **AI output validation is strict, not best-effort.** Pydantic schemas define exactly what a valid suggestion looks like (category/sub_category from the configured set, priority from the allowed enum, non-empty summary/reasoning). Malformed JSON, missing fields, or out-of-vocabulary values are never silently coerced into something plausible — the backend either normalizes through an explicitly supported mapping or marks the analysis `FAILED` and leaves the issue in its current business state for manual triage.
 
 ## IMPORTANT DECISIONS
-See DECISIONS.md for full reasoning. Summary: monolithic FastAPI + React (Option A) with FastAPI `BackgroundTasks` for AI chosen over a Celery/Redis worker split (Option B) and microservices (Option C) for MVP — revisit Option B only if AI load or retry guarantees demand it. AI processing state (`ai_analysis_status`) is kept strictly separate from the issue business lifecycle (`status`). No LangChain/RAG/vector DB/agent framework is used — the `AIProvider` is a plain, understandable abstraction over an OpenAI-compatible API. Database (Phase 2): UUIDv4 keys everywhere, RESTRICT-vs-CASCADE deletion split, composite FKs for category/sub-category integrity, and a GiST exclusion constraint for SLA pause intervals — see D15–D19. Auth (Phase 3): JWT carries no role claim, role/is_active always reloaded from the database per request, stateless logout, localStorage token storage, in-memory single-process rate limiting — see D20–D28. Issues (Phase 4): coarse-grained owner/staff authorization, `SELECT FOR UPDATE`-backed transition validation, RESOLVED→CLOSED structurally blocked until Phase 7 — see D29–D32. AI/routing (Phase 5): `ai_analysis_results` built now, structural-vs-semantic validation split, whole-word priority-escalation matching, injectable provider/session for testability, reanalyze cooldown/scope rules, dev-only reference-data seed — see D33–D39. SLA (Phase 6): pause/resume atomic with the triggering transition, pure DB-reconstructable computation, 20%-remaining at-risk threshold — see D40.
+See DECISIONS.md for full reasoning. Summary: monolithic FastAPI + React (Option A) with FastAPI `BackgroundTasks` for AI chosen over a Celery/Redis worker split (Option B) and microservices (Option C) for MVP — revisit Option B only if AI load or retry guarantees demand it. AI processing state (`ai_analysis_status`) is kept strictly separate from the issue business lifecycle (`status`). No LangChain/RAG/vector DB/agent framework is used — the `AIProvider` is a plain, understandable abstraction over an OpenAI-compatible API. Database (Phase 2): UUIDv4 keys everywhere, RESTRICT-vs-CASCADE deletion split, composite FKs for category/sub-category integrity, and a GiST exclusion constraint for SLA pause intervals — see D15–D19. Auth (Phase 3): JWT carries no role claim, role/is_active always reloaded from the database per request, stateless logout, localStorage token storage, in-memory single-process rate limiting — see D20–D28. Issues (Phase 4): `SELECT FOR UPDATE`-backed transition validation — see D29–D32. AI/routing (Phase 5): `ai_analysis_results` built now, structural-vs-semantic validation split, whole-word priority-escalation matching, injectable provider/session for testability, reanalyze cooldown/scope rules, dev-only reference-data seed — see D33–D39. SLA (Phase 6): pause/resume atomic with the triggering transition, pure DB-reconstructable computation, 20%-remaining at-risk threshold — see D40. Resolver workflow (Phase 7): team-scoped access narrowing D29, append-only assignment, atomic owner-reply auto-resume, owner-only confirm/reject — see D41.
 
 ## KNOWN BUGS
 None currently known. (One real bug — naive substring keyword matching in priority escalation — was found and fixed during Phase 5; see DECISIONS.md D36. Not currently open.)
 
 ## CURRENT STATUS
-Phase 6 (SLA engine) complete, on top of Phases 2–5. Architecture approved by the developer through four rounds of clarification (D1–D14), the database layer (D15–D19), authentication/RBAC (D20–D28), the issue domain (D29–D32), AI/routing (D33–D39), and now the SLA engine (D40) — all in DECISIONS.md.
+Phase 7 (comments, assignments, resolver workflow) complete, on top of Phases 2–6. Architecture approved by the developer through four rounds of clarification (D1–D14), the database layer (D15–D19), authentication/RBAC (D20–D28), the issue domain (D29–D32), AI/routing (D33–D39), the SLA engine (D40), and now the resolver workflow (D41) — all in DECISIONS.md.
 
-Verified working: 157 pytest tests passing (40 database + 47 auth/RBAC + 28 issue domain + 27 AI/routing/reanalyze + 15 SLA, including a restart-simulation test and a real concurrency test for simultaneous `WAITING_FOR_USER` entry), all against a real PostgreSQL database; the full pause/resume cycle was also verified **live** against a real routed issue — a real ~18-second `WAITING_FOR_USER` window was correctly excluded from `effective_elapsed_seconds` and correctly reflected in `accumulated_pause_seconds` after resuming, confirmed via the API response itself, not just direct database inspection. Frontend still builds and boots unaffected (no issue UI yet — Phase 8).
+Verified working: 194 pytest tests passing (40 database + 47 auth/RBAC + 28 issue domain + 27 AI/routing/reanalyze + 15 SLA + 37 comments/assignments/team-scoping/resolution-confirmation), all against a real PostgreSQL database; the full end-to-end lifecycle was also verified **live** with a real routed issue — self-assignment, `WAITING_FOR_USER`, a non-owner comment that correctly did *not* resume it, an owner comment that correctly did (and correctly closed the SLA pause, ~16s excluded), `RESOLVED`, a resolver's confirm attempt correctly rejected (403), and the owner's confirm correctly closing it. Frontend still builds and boots unaffected (no issue UI yet — Phase 8).
 
 ## PENDING TASKS
-- Phase 7: comments, assignments/reassignment, resolver workflow (incl. the atomic auto-resume-on-owner-reply rule for `WAITING_FOR_USER`, and the dedicated `RESOLVED → CLOSED` user-confirmation flow).
-- Phases 8–11: dashboards/admin → security attack pass → production deployment.
+- Phase 8: dashboards + admin management (users/teams/categories/sub-categories/routing rules/SLA rules — replacing the dev-only seed script with a real UI).
+- Phases 9–11: security/failure/concurrency attack pass → production deployment.
 
 ## CONSTRAINTS
 - No SQLite as a Postgres substitute, anywhere.

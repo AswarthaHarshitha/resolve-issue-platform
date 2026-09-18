@@ -138,6 +138,24 @@ class IssueListResponse(BaseModel):
     page_size: int
 
 
+class AssignmentUpdateRequest(BaseModel):
+    """All fields optional: a RESOLVER self-assigning sends neither
+    team_id nor resolver_id (the service fills in "my team" / "myself");
+    an ADMIN reassigning sends whichever of the two is actually changing."""
+
+    team_id: Optional[UUID] = None
+    resolver_id: Optional[UUID] = None
+    reason: Optional[str] = None
+
+    @field_validator("reason")
+    @classmethod
+    def normalize_reason(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
 class IssueStatusUpdateRequest(BaseModel):
     """Only the target status is accepted - never a client-supplied "current"
     status. The service layer loads the real current status under a row
