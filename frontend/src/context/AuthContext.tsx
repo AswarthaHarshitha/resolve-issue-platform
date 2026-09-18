@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import * as authApi from "../services/authApi";
+import type { LoginContext } from "../services/authApi";
 import { clearStoredToken, getStoredToken, setStoredToken } from "../services/tokenStorage";
 import type { User } from "../types/auth";
 
@@ -8,7 +9,7 @@ interface AuthContextValue {
   user: User | null;
   token: string | null;
   isLoading: boolean;
-  login: (email: string, password: string) => Promise<void>;
+  login: (email: string, password: string, loginContext?: LoginContext) => Promise<void>;
   register: (email: string, password: string, fullName: string) => Promise<void>;
   logout: () => void;
 }
@@ -43,8 +44,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       .finally(() => setIsLoading(false));
   }, []);
 
-  async function login(email: string, password: string) {
-    const response = await authApi.login(email, password);
+  async function login(email: string, password: string, loginContext?: LoginContext) {
+    const response = await authApi.login(email, password, loginContext);
     setStoredToken(response.access_token);
     setToken(response.access_token);
     setUser(response.user);

@@ -8,10 +8,12 @@ export function register(email: string, password: string, fullName: string): Pro
   });
 }
 
-export function login(email: string, password: string): Promise<AuthResponse> {
+export type LoginContext = "student" | "resolver" | "admin";
+
+export function login(email: string, password: string, loginContext?: LoginContext): Promise<AuthResponse> {
   return apiRequest<AuthResponse>("/api/v1/auth/login", {
     method: "POST",
-    body: JSON.stringify({ email, password }),
+    body: JSON.stringify({ email, password, login_context: loginContext }),
   });
 }
 

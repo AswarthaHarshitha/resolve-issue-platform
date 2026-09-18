@@ -1,4 +1,5 @@
 import re
+from typing import Literal, Optional
 
 from pydantic import BaseModel, EmailStr, field_validator
 
@@ -52,6 +53,12 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+    # Which of the three frontend entry points (/student-login,
+    # /resolver-login, /admin-login) this request came from - a UX gate
+    # only, never trusted as proof of role. Omitted entirely by the plain
+    # /auth/login callers (existing tests, direct API use). See
+    # DECISIONS.md D50.
+    login_context: Optional[Literal["student", "resolver", "admin"]] = None
 
     @field_validator("email")
     @classmethod

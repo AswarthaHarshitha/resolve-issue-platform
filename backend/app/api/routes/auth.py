@@ -34,7 +34,9 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> User:
 )
 def login(payload: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse:
     try:
-        user = auth_service.authenticate_user(db, email=payload.email, password=payload.password)
+        user = auth_service.authenticate_user(
+            db, email=payload.email, password=payload.password, login_context=payload.login_context
+        )
     except auth_service.InvalidCredentialsError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect email or password")
     except auth_service.AccountDisabledError:
