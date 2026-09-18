@@ -17,6 +17,13 @@ export function login(email: string, password: string, loginContext?: LoginConte
   });
 }
 
+export function activate(token: string, password: string, fullName: string): Promise<AuthResponse> {
+  return apiRequest<AuthResponse>("/api/v1/auth/activate", {
+    method: "POST",
+    body: JSON.stringify({ token, password, full_name: fullName }),
+  });
+}
+
 export function getCurrentUser(token: string): Promise<User> {
   return apiRequest<User>("/api/v1/auth/me", {}, token);
 }

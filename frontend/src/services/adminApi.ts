@@ -1,5 +1,5 @@
 import { apiRequest } from "./api";
-import type { AdminCategory, AdminRoutingRule, AdminSLARule, AdminTeam, AdminUser } from "../types/admin";
+import type { AdminCategory, AdminInvite, AdminRoutingRule, AdminSLARule, AdminTeam, AdminUser, CreatedInvite } from "../types/admin";
 import type { IssuePriority } from "../types/issue";
 
 export function listTeams(token: string): Promise<AdminTeam[]> {
@@ -105,6 +105,24 @@ export function updateUser(
         team_id: params.teamId ?? null,
         is_active: params.isActive ?? null,
       }),
+    },
+    token,
+  );
+}
+
+export function listPendingInvites(token: string): Promise<AdminInvite[]> {
+  return apiRequest<AdminInvite[]>("/api/v1/admin/invites", {}, token);
+}
+
+export function createInvite(
+  token: string,
+  params: { email: string; role: "RESOLVER" | "ADMIN"; teamId?: string },
+): Promise<CreatedInvite> {
+  return apiRequest<CreatedInvite>(
+    "/api/v1/admin/invites",
+    {
+      method: "POST",
+      body: JSON.stringify({ email: params.email, role: params.role, team_id: params.teamId ?? null }),
     },
     token,
   );

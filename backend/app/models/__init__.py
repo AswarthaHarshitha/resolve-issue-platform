@@ -4,6 +4,7 @@ autogenerate, create_all, or any query runs."""
 
 from app.models.ai_analysis_result import AIAnalysisResult
 from app.models.category import Category
+from app.models.invite import Invite
 from app.models.issue import Issue
 from app.models.issue_assignment import IssueAssignment
 from app.models.issue_comment import IssueComment
@@ -20,6 +21,7 @@ from app.models.user import User
 __all__ = [
     "AIAnalysisResult",
     "Category",
+    "Invite",
     "Issue",
     "IssueAssignment",
     "IssueComment",

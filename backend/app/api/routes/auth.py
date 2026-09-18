@@ -6,8 +6,9 @@ from app.core.rate_limit import enforce_auth_rate_limit
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.auth import LoginRequest, RegisterRequest, TokenResponse
+from app.schemas.invite import InviteActivateRequest, InviteActivateResponse
 from app.schemas.user import UserPublic
-from app.services import auth_service
+from app.services import auth_service, invite_service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -44,6 +45,28 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse
 
     token = auth_service.issue_access_token(user)
     return TokenResponse(access_token=token, user=user)
+
+
+@router.post(
+    "/activate",
+    response_model=InviteActivateResponse,
+    dependencies=[Depends(enforce_auth_rate_limit)],
+)
+def activate_invite(payload: InviteActivateRequest, db: Session = Depends(get_db)) -> InviteActivateResponse:
+    """Public, unauthenticated - the one-time token itself is the proof of
+    authorization here, exactly like a password-reset link (DECISIONS.md
+    D52). A RESOLVER/ADMIN account is created with the role/team the
+    inviting admin specified - never anything the activation request body
+    could influence."""
+    try:
+        user = invite_service.activate_invite(
+            db, raw_token=payload.token, password=payload.password, full_name=payload.full_name
+        )
+    except invite_service.InvalidOrExpiredTokenError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This invitation link is invalid or has expired")
+
+    token = auth_service.issue_access_token(user)
+    return InviteActivateResponse(access_token=token, user=user)
 
 
 @router.get("/me", response_model=UserPublic)

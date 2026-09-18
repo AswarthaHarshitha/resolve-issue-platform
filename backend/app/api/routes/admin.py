@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.roles import require_admin
 from app.db.session import get_db
 from app.models.category import Category
@@ -26,10 +27,12 @@ from app.schemas.admin import (
     TeamUpdateRequest,
     UserAdminUpdateRequest,
 )
+from app.schemas.invite import InviteCreateRequest, InviteListItemPublic, InvitePublic
 from app.schemas.user import UserPublic
-from app.services import admin_service
+from app.services import admin_service, invite_service
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
+settings = get_settings()
 
 
 def _handle_integrity_error(exc: IntegrityError):
@@ -232,3 +235,33 @@ def update_user(user_id: UUID, payload: UserAdminUpdateRequest, db: Session = De
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     except admin_service.ValidationError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+# --- Invites (DECISIONS.md D52) ---------------------------------------------
+
+
+@router.get("/invites", response_model=list[InviteListItemPublic])
+def list_pending_invites(db: Session = Depends(get_db)) -> list[InviteListItemPublic]:
+    return invite_service.list_pending_invites(db)
+
+
+@router.post("/invites", response_model=InvitePublic, status_code=status.HTTP_201_CREATED)
+def create_invite(
+    payload: InviteCreateRequest, current_user: User = Depends(require_admin), db: Session = Depends(get_db)
+) -> InvitePublic:
+    try:
+        invite, raw_token = invite_service.create_invite(
+            db, invited_by=current_user, email=payload.email, role=payload.role, team_id=payload.team_id
+        )
+    except invite_service.ValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    frontend_base = settings.cors_origins_list[0] if settings.cors_origins_list else ""
+    return InvitePublic(
+        id=invite.id,
+        email=invite.email,
+        role=invite.role.name,
+        team=invite.team,
+        expires_at=invite.expires_at,
+        activation_url=f"{frontend_base}/activate?token={raw_token}",
+    )

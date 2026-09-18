@@ -2,6 +2,7 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { AdminRoute } from "./components/AdminRoute";
 import { ProtectedRoute } from "./components/ProtectedRoute";
 import { AuthProvider } from "./context/AuthContext";
+import { ActivateAccountPage } from "./pages/ActivateAccountPage";
 import { AdminPage } from "./pages/AdminPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { IssueCreatePage } from "./pages/IssueCreatePage";
@@ -32,6 +33,7 @@ function App() {
             element={<RoleLoginPage context="admin" title="Admin Login" subtitle="Manage the platform" />}
           />
           <Route path="/register" element={<RegisterPage />} />
+          <Route path="/activate" element={<ActivateAccountPage />} />
           <Route
             path="/"
             element={

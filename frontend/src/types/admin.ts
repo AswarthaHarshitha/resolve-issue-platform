@@ -41,3 +41,20 @@ export interface AdminSLARule {
 }
 
 export type { User as AdminUser };
+
+export interface AdminInvite {
+  id: string;
+  email: string;
+  expires_at: string;
+  used_at: string | null;
+  created_at: string;
+}
+
+export interface CreatedInvite {
+  id: string;
+  email: string;
+  role: string;
+  team: { id: string; name: string } | null;
+  expires_at: string;
+  activation_url: string;
+}

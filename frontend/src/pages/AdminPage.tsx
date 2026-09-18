@@ -5,7 +5,7 @@ import { useAuth } from "../context/AuthContext";
 import { ApiError } from "../services/api";
 import * as adminApi from "../services/adminApi";
 import { ALL_PRIORITIES } from "../services/issuesApi";
-import type { AdminCategory, AdminRoutingRule, AdminSLARule, AdminTeam, AdminUser } from "../types/admin";
+import type { AdminCategory, AdminInvite, AdminRoutingRule, AdminSLARule, AdminTeam, AdminUser, CreatedInvite } from "../types/admin";
 import type { IssuePriority } from "../types/issue";
 
 function SectionCard({ title, children }: { title: string; children: React.ReactNode }) {
@@ -24,6 +24,7 @@ export function AdminPage() {
   const [routingRules, setRoutingRules] = useState<AdminRoutingRule[]>([]);
   const [slaRules, setSlaRules] = useState<AdminSLARule[]>([]);
   const [users, setUsers] = useState<AdminUser[]>([]);
+  const [pendingInvites, setPendingInvites] = useState<AdminInvite[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const [newTeamName, setNewTeamName] = useState("");
@@ -36,6 +37,11 @@ export function AdminPage() {
   const [slaFirstResponse, setSlaFirstResponse] = useState(60);
   const [slaResolution, setSlaResolution] = useState(1440);
 
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState<"RESOLVER" | "ADMIN">("RESOLVER");
+  const [inviteTeamId, setInviteTeamId] = useState("");
+  const [lastCreatedInvite, setLastCreatedInvite] = useState<CreatedInvite | null>(null);
+
   function load() {
     if (!token) return;
     Promise.all([
@@ -44,13 +50,15 @@ export function AdminPage() {
       adminApi.listRoutingRules(token),
       adminApi.listSLARules(token),
       adminApi.listUsers(token),
+      adminApi.listPendingInvites(token),
     ])
-      .then(([teamsResult, categoriesResult, routingResult, slaResult, usersResult]) => {
+      .then(([teamsResult, categoriesResult, routingResult, slaResult, usersResult, invitesResult]) => {
         setTeams(teamsResult);
         setCategories(categoriesResult);
         setRoutingRules(routingResult);
         setSlaRules(slaResult);
         setUsers(usersResult);
+        setPendingInvites(invitesResult);
       })
       .catch(() => setError("Could not load admin data."));
   }
@@ -101,6 +109,28 @@ export function AdminPage() {
       load();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not create routing rule.");
+    }
+  }
+
+  async function handleCreateInvite(event: FormEvent) {
+    event.preventDefault();
+    if (!token || !inviteEmail.trim()) return;
+    if (inviteRole === "RESOLVER" && !inviteTeamId) {
+      setError("A resolver invite needs a team.");
+      return;
+    }
+    try {
+      const created = await adminApi.createInvite(token, {
+        email: inviteEmail.trim(),
+        role: inviteRole,
+        teamId: inviteRole === "RESOLVER" ? inviteTeamId : undefined,
+      });
+      setLastCreatedInvite(created);
+      setInviteEmail("");
+      setInviteTeamId("");
+      load();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not create invite.");
     }
   }
 
@@ -302,6 +332,97 @@ export function AdminPage() {
               Add SLA rule
             </button>
           </form>
+        </SectionCard>
+
+        <SectionCard title="Invite a resolver or admin">
+          <p className="mb-3 text-xs text-text-secondary">
+            The invited person sets their own password - you never choose or see it. Copy the activation link below
+            and send it to them yourself (no email is sent automatically).
+          </p>
+          <form onSubmit={handleCreateInvite} className="flex flex-wrap items-end gap-2">
+            <div>
+              <label className="block text-xs text-text-secondary">Email</label>
+              <input
+                type="email"
+                required
+                value={inviteEmail}
+                onChange={(event) => setInviteEmail(event.target.value)}
+                className="rounded-md border border-border bg-background px-2 py-1 text-sm text-text-primary"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-text-secondary">Role</label>
+              <select
+                value={inviteRole}
+                onChange={(event) => setInviteRole(event.target.value as "RESOLVER" | "ADMIN")}
+                className="rounded-md border border-border bg-background px-2 py-1 text-sm text-text-primary"
+              >
+                <option value="RESOLVER">Resolver</option>
+                <option value="ADMIN">Admin</option>
+              </select>
+            </div>
+            {inviteRole === "RESOLVER" && (
+              <div>
+                <label className="block text-xs text-text-secondary">Team</label>
+                <select
+                  required
+                  value={inviteTeamId}
+                  onChange={(event) => setInviteTeamId(event.target.value)}
+                  className="rounded-md border border-border bg-background px-2 py-1 text-sm text-text-primary"
+                >
+                  <option value="" disabled>
+                    Select a team...
+                  </option>
+                  {teams.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            <button type="submit" className="rounded-md bg-accent px-3 py-1 text-sm font-medium text-surface hover:opacity-90">
+              Create invite
+            </button>
+          </form>
+
+          {lastCreatedInvite && (
+            <div className="mt-4 rounded-md border border-accent bg-background p-3">
+              <p className="text-xs font-medium text-text-primary">
+                Invite created for {lastCreatedInvite.email} ({lastCreatedInvite.role}
+                {lastCreatedInvite.team ? ` · ${lastCreatedInvite.team.name}` : ""}) - copy this link and send it to
+                them:
+              </p>
+              <input
+                readOnly
+                value={lastCreatedInvite.activation_url}
+                onFocus={(event) => event.target.select()}
+                className="mt-2 w-full rounded-md border border-border bg-surface px-2 py-1 text-xs text-text-primary"
+              />
+            </div>
+          )}
+
+          {pendingInvites.length > 0 && (
+            <div className="mt-4 overflow-x-auto">
+              <p className="mb-1 text-xs font-medium text-text-secondary">Pending invites</p>
+              <table className="w-full min-w-[320px] text-left text-sm">
+                <thead className="text-xs uppercase tracking-wide text-text-secondary">
+                  <tr>
+                    <th className="py-1">Email</th>
+                    <th className="py-1">Expires</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pendingInvites.map((invite) => (
+                    <tr key={invite.id} className="border-t border-border">
+                      <td className="py-1">{invite.email}</td>
+                      <td className="py-1">{new Date(invite.expires_at).toLocaleString()}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </SectionCard>
 
         <SectionCard title="Users">

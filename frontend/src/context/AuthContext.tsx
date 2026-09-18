@@ -11,6 +11,7 @@ interface AuthContextValue {
   isLoading: boolean;
   login: (email: string, password: string, loginContext?: LoginContext) => Promise<void>;
   register: (email: string, password: string, fullName: string) => Promise<void>;
+  activate: (activationToken: string, password: string, fullName: string) => Promise<void>;
   logout: () => void;
 }
 
@@ -56,6 +57,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await login(email, password);
   }
 
+  async function activate(activationToken: string, password: string, fullName: string) {
+    const response = await authApi.activate(activationToken, password, fullName);
+    setStoredToken(response.access_token);
+    setToken(response.access_token);
+    setUser(response.user);
+  }
+
   function logout() {
     if (token) {
       // Best-effort only: the MVP logout strategy is stateless (DECISIONS.md
@@ -69,7 +77,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   return (
-    <AuthContext.Provider value={{ user, token, isLoading, login, register, logout }}>
+    <AuthContext.Provider value={{ user, token, isLoading, login, register, activate, logout }}>
       {children}
     </AuthContext.Provider>
   );
