@@ -2,6 +2,15 @@
 
 Intelligent Issue Resolution Platform.
 
+## Live application
+
+- **Frontend:** https://resolve-issue-platform.vercel.app
+- **Backend API:** https://resolve-backend-but8.onrender.com
+- **Health check:** https://resolve-backend-but8.onrender.com/health
+- **API docs (Swagger UI):** https://resolve-backend-but8.onrender.com/docs
+
+Free-tier hosting: the backend (Render free web service) spins down after periods of inactivity and takes roughly 30-60 seconds to wake up on the next request (a cold start, not a bug); the database (Supabase free project) can similarly pause after extended inactivity and resume automatically on the next connection. Neither is masked with artificial keep-alive traffic - see "Known limitations" below.
+
 ## Problem
 
 Organizations receive many complaints and service requests. Manual triage often means requests are miscategorized, assigned to the wrong team, forgotten, duplicated, or resolved slowly — and the person who submitted the request has no visibility into what happens to it next.
@@ -82,7 +91,7 @@ source .venv/bin/activate   # or run this inside the backend container
 alembic upgrade head
 ```
 
-This creates all 13 tables, their constraints/indexes, and seeds the three baseline roles (`USER`/`RESOLVER`/`ADMIN` — required reference data, not demo content; see DECISIONS.md D16). `alembic downgrade base` fully reverses it. Point `DATABASE_URL` at a fresh database and re-run `alembic upgrade head` any time you need a clean schema.
+This creates all 15 tables, their constraints/indexes, and seeds the three baseline roles (`USER`/`RESOLVER`/`ADMIN` — required reference data, not demo content; see DECISIONS.md D16). `alembic downgrade base` fully reverses it. Point `DATABASE_URL` at a fresh database and re-run `alembic upgrade head` any time you need a clean schema.
 
 ## Running locally
 
@@ -129,6 +138,75 @@ cp .env.example .env
 npm run dev
 ```
 
+## Production deployment
+
+### Architecture
+
+```
+                 Internet
+                    │
+                    ▼
+         React frontend (Vercel, free)
+                    │
+                    │ HTTPS, VITE_API_BASE_URL
+                    ▼
+        FastAPI backend (Render, free web service)
+                    │
+          ┌─────────┴─────────┐
+          ▼                   ▼
+  PostgreSQL (Supabase,   AI provider (OpenAI-
+  free, via connection    compatible endpoint,
+  pooler)                 configured by env var)
+```
+
+Same architecture as local development - a layered monolith, no queue, no cache, no microservices. The only difference between environments is configuration (`ENVIRONMENT=production`, real secrets, the production CORS origin) - no code path branches on which environment it's running in beyond that.
+
+### Environment variables (production)
+
+Set as secrets in each provider's dashboard - **never committed**. Same names as `backend/.env.example`/`frontend/.env.example`:
+
+| Variable | Production value |
+|---|---|
+| `ENVIRONMENT` | `production` |
+| `DATABASE_URL` | Supabase's **connection pooler** URI (not the direct `db.<ref>.supabase.co` string - that host is IPv6-only and unreachable from most free-tier platform egress, Render's included) |
+| `JWT_SECRET_KEY` | A long random value, distinct from any development secret |
+| `CORS_ALLOW_ORIGINS` | The exact deployed frontend origin (`https://resolve-issue-platform.vercel.app`) - never `*` |
+| `OPENAI_API_KEY` / `OPENAI_MODEL` / `OPENAI_BASE_URL` | The real AI provider credentials, same `AIProvider` abstraction as local dev |
+| `VITE_API_BASE_URL` (frontend, Vercel) | The deployed backend origin (`https://resolve-backend-but8.onrender.com`) - baked in at build time, since Vite env vars aren't a runtime concept |
+
+### Database migration
+
+Identical mechanism to local development - `alembic upgrade head` - just pointed at the production `DATABASE_URL` (the pooler URI) instead of a local one. Applied once, directly, from a trusted machine with the production connection string in hand; not run automatically on every deploy in this MVP (the Render start command does include it, so it also re-runs - harmlessly, since Alembic no-ops when already at head - on every redeploy).
+
+### Initial production admin
+
+The application **never** creates a production admin automatically - there is no seed, no startup hook, no endpoint that can produce an `ADMIN` account (registration always creates `USER`, DECISIONS.md D23). `backend/scripts/bootstrap_dev_admin.py` explicitly refuses to run outside `ENVIRONMENT=development` and is never exposed as an HTTP route, so it cannot become a production bootstrap path even by accident.
+
+The secure procedure actually used: a single, one-time, direct write against the production database (the same real `hash_password` function the application itself uses - bcrypt, never a plaintext or weakened hash), run once from a trusted machine holding the production connection string, immediately after the schema was created. The resulting credential was displayed exactly once, in that terminal session, and is not stored anywhere - not in this repository, not in any file, not in chat history beyond that one disclosure. Losing it means creating a new admin the same way, or having an existing admin issue an `ADMIN` invite (see "Resolver workflow" - the invite mechanism works identically for provisioning a second admin, and is the preferred path for every admin after the first).
+
+### Deployment flow
+
+```
+clone repo
+   ↓
+configure secrets (provider dashboards - never .env files in git)
+   ↓
+create Supabase project → copy the connection pooler URI
+   ↓
+alembic upgrade head (against that URI, once)
+   ↓
+deploy backend (Render: Python runtime, buildCommand `pip install -r requirements.txt`,
+                 startCommand `alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT`)
+   ↓
+deploy frontend (Vercel: auto-detects Vite, VITE_API_BASE_URL set to the Render URL)
+   ↓
+set CORS_ALLOW_ORIGINS on the backend to the real deployed frontend origin
+   ↓
+verify GET /health
+```
+
+A push to `main` on GitHub redeploys both services automatically (Render and Vercel are each connected to the repository).
+
 ## Testing
 
 ```bash
@@ -173,7 +251,9 @@ Pause/resume is wired directly into the status-transition endpoint: entering `WA
 
 ## Current status
 
-Phase 9 (security, failure, and concurrency attack pass) is complete, on top of Phases 2–8. 238 passing pytest tests (up from 223 going into this phase), all against a real PostgreSQL database, 0 failed. Beyond pytest, this phase's verification was a genuine attack pass against a running, Docker-composed instance: real HTTP JWT/IDOR/RBAC/lifecycle/CORS/rate-limit/input-validation attacks, a real parallel-HTTP concurrent status-transition race, and a real prompt-injection attempt run against the actual configured Gemini provider (not a mock) — the model itself recognized and rejected the injection, and the backend's deterministic validation would have rejected a fooled/malicious response regardless. Five genuine bugs were found and fixed this phase — see "Security considerations" below and DECISIONS.md D44–D48 for full root-cause/fix/regression-test detail on each. All temporary attack/verification accounts and issues were deleted from the dev database afterward; no test credentials are documented anywhere in this repo. See PROJECT_CONTEXT.md's SECURITY & FAILURE ATTACK PASS section for the complete findings list. This README does not claim functionality that doesn't exist yet.
+Deployed and live (see "Live application" above): a real, publicly accessible instance running on Vercel (frontend) + Render (backend) + Supabase (PostgreSQL), all free-tier. Migrations applied and verified against the production database; the full USER → RESOLVER → ADMIN issue lifecycle (creation, real AI analysis, deterministic routing, SLA pause/resume, resolution, owner confirmation) and the full production RBAC/security suite (IDOR, cross-role access, unauthenticated/invalid-token rejection, role tampering) were verified with real HTTP requests against the live deployment, not just locally. All temporary smoke-test accounts and issues created during that verification were deleted from production afterward; only the one intentional admin account and real reference-data configuration (categories/teams/routing/SLA rules) remain.
+
+253 passing pytest tests, all against a real PostgreSQL database, 0 failed. This followed a full security/failure/concurrency attack pass (JWT/IDOR/RBAC/lifecycle/CORS/rate-limit/input-validation attacks, a real parallel-HTTP concurrent status-transition race, and a real prompt-injection attempt against the actual configured Gemini provider) that found and fixed five genuine defects — see DECISIONS.md D44–D48 for full root-cause/fix/regression-test detail on each, and D50–D52 for the separate student/resolver/admin login entry points and the admin-issued RESOLVER/ADMIN invitation system added afterward. This README does not claim functionality that doesn't exist yet.
 
 ## Security considerations
 
@@ -183,7 +263,8 @@ Implemented and verified through Phases 3–9: passwords hashed with bcrypt, nev
 
 ## Limitations
 
-- No dedicated admin/resolver account self-service signup flow — promotion to `RESOLVER`/`ADMIN` is only possible through the `/admin/users` endpoint by an existing admin (by design — see DECISIONS.md D23); the very first admin account for a fresh deployment still requires one direct database write to bootstrap.
+- No self-service signup for `RESOLVER`/`ADMIN` — those roles are only reachable through an existing admin's invitation (DECISIONS.md D52) or, for the very first admin of a fresh deployment, one deliberate direct-database write (documented above under "Initial production admin"). `USER` remains the only self-registerable role (DECISIONS.md D23).
+- Render's free web service sleeps after inactivity - the first request after a period of no traffic can take 30-60 seconds (cold start) before the API responds. Supabase's free project can similarly pause after extended inactivity. Both are accepted, documented free-tier tradeoffs, not bugs - no artificial keep-alive traffic was added to mask them.
 - The SLA "at risk" threshold (20% of duration remaining) is a fixed, documented heuristic, not a per-category/priority configurable rule — reasonable for MVP, would be a natural refinement later.
 - Logout does not invalidate the token server-side (stateless JWT tradeoff, DECISIONS.md D22) — a "logged out" token remains usable until it naturally expires (60 minutes by default).
 - Auth rate limiting is in-memory and single-process — it does not protect a horizontally-scaled, multi-instance deployment (DECISIONS.md D25).
@@ -197,6 +278,6 @@ Implemented and verified through Phases 3–9: passwords hashed with bcrypt, nev
 
 ## Future improvements
 
-- Duplicate/related-issue detection (Phase 10), suggestion-only, no auto-merge.
+- Duplicate/related-issue detection, suggestion-only, no auto-merge.
 - Durable AI task queue (Celery/Redis or similar) if AI load or retry guarantees demand it — see DECISIONS.md D1.
 - Email/push notifications.
